@@ -15,8 +15,11 @@ TASK1_TARGET_MODULES = (
     "down_proj",
 )
 
+
 @torch.no_grad()
-def compute_top_k_svd_bases(weight: torch.Tensor, k: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:
+def compute_top_k_svd_bases(
+    weight: torch.Tensor, k: int = 128
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute leading k left and right singular vector matrices U_k (d_out x k), V_k (d_in x k) in FP32."""
     W_fp32 = weight.detach().to(torch.float32)
     U, _, Vh = torch.linalg.svd(W_fp32, full_matrices=False)
@@ -25,13 +28,17 @@ def compute_top_k_svd_bases(weight: torch.Tensor, k: int = 128) -> Tuple[torch.T
     V_k = Vh[:k_eff, :].transpose(0, 1).contiguous()
     return U_k, V_k
 
+
 class LoRALinear(nn.Module):
     """
-    LoRA and OPLoRA wrapper for a frozen Linear layer.
-    Backbone weight W_0 remains frozen (FP16 on GPU), while A (r x d_in) and B (d_out x r) are FP32.
-    For OPLoRA, leading singular bases U_k (d_out x k) and V_k (d_in x k) are frozen in FP32:
-        B_tilde = B - U_k (U_k^T B),   A_tilde = A - (A V_k) V_k^T
-        Delta W = (alpha / r) B_tilde A_tilde
+    Low-Rank Adaptation (LoRA) and Orthogonal Projection LoRA (OPLoRA) wrapper.
+    - Frozen FP16 backbone weight W_0; trainable FP32 adapter matrices A (r x d_in) and B (d_out x r).
+    - Deterministic per-layer initialization seeded by (init_seed + layer_tag) so LoRA-16 and OPLoRA-16
+      share identical initial unprojected factors.
+    - For OPLoRA, uses effective factors:
+          B_tilde = B - U_k (U_k^T B),   A_tilde = A - (A V_k) V_k^T
+          Delta W = (alpha / r) B_tilde A_tilde
+      without forming dense d x d projection matrices.
     """
     def __init__(
         self,
@@ -62,7 +69,6 @@ class LoRALinear(nn.Module):
 
         self.lora_dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
-        # Deterministic per-layer initialization so LoRA-16 and OPLoRA-16 start with identical (A, B)
         gen = torch.Generator(device="cpu")
         tag_hash = sum((i + 1) * ord(ch) for i, ch in enumerate(layer_tag))
         gen.manual_seed(init_seed + tag_hash)
@@ -79,9 +85,15 @@ class LoRALinear(nn.Module):
             if precomputed_bases is not None:
                 U_k, V_k = precomputed_bases
             else:
-                U_k, V_k = compute_top_k_svd_bases(self.base_layer.weight.data, k=protection_rank_k)
-            self.register_buffer("U_k", U_k.to(device=device, dtype=torch.float32), persistent=False)
-            self.register_buffer("V_k", V_k.to(device=device, dtype=torch.float32), persistent=False)
+                U_k, V_k = compute_top_k_svd_bases(
+                    self.base_layer.weight.data, k=protection_rank_k
+                )
+            self.register_buffer(
+                "U_k", U_k.to(device=device, dtype=torch.float32), persistent=False
+            )
+            self.register_buffer(
+                "V_k", V_k.to(device=device, dtype=torch.float32), persistent=False
+            )
         else:
             self.register_buffer("U_k", None, persistent=False)
             self.register_buffer("V_k", None, persistent=False)
@@ -90,8 +102,12 @@ class LoRALinear(nn.Module):
         """Return (A_eff, B_eff) in FP32. For OPLoRA returns projected factors (A_tilde, B_tilde)."""
         if not self.use_oplora:
             return self.lora_A, self.lora_B
-        B_tilde = self.lora_B - torch.matmul(self.U_k, torch.matmul(self.U_k.transpose(0, 1), self.lora_B))
-        A_tilde = self.lora_A - torch.matmul(torch.matmul(self.lora_A, self.V_k), self.V_k.transpose(0, 1))
+        B_tilde = self.lora_B - torch.matmul(
+            self.U_k, torch.matmul(self.U_k.transpose(0, 1), self.lora_B)
+        )
+        A_tilde = self.lora_A - torch.matmul(
+            torch.matmul(self.lora_A, self.V_k), self.V_k.transpose(0, 1)
+        )
         return A_tilde, B_tilde
 
     def get_delta_weight(self) -> torch.Tensor:
@@ -103,8 +119,12 @@ class LoRALinear(nn.Module):
         base_out = self.base_layer(x)
         x_dropped = self.lora_dropout(x).to(torch.float32)
         A_eff, B_eff = self.get_effective_factors()
-        lora_out = torch.matmul(torch.matmul(x_dropped, A_eff.transpose(0, 1)), B_eff.transpose(0, 1))
-        return base_out + (self.scaling * lora_out).to(base_out.dtype)
+        lora_out = torch.matmul(
+            torch.matmul(x_dropped, A_eff.transpose(0, 1)), B_eff.transpose(0, 1)
+        )
+        lora_out = (self.scaling * lora_out).to(base_out.dtype)
+        return base_out + lora_out
+
 
 def inject_adapters(
     model: nn.Module,
@@ -117,7 +137,10 @@ def inject_adapters(
     init_seed: int = 6304,
     precomputed_svd_dict: Optional[Dict[str, Tuple[torch.Tensor, torch.Tensor]]] = None,
 ) -> Dict[str, float]:
-    """Freeze backbone and wrap target linear layers with LoRALinear / OPLoRA."""
+    """
+    Freeze backbone in FP16 and wrap all target linear layers with LoRALinear / OPLoRA.
+    Records SVD preprocessing time, basis storage size, and trainable adapter parameter count.
+    """
     for param in model.parameters():
         param.requires_grad_(False)
 
@@ -163,9 +186,15 @@ def inject_adapters(
         "basis_storage_mb": basis_bytes / (1024 ** 2),
     }
 
+
 @torch.no_grad()
-def export_adapter_state(model: nn.Module, save_path: str | Path, export_projected: bool = True) -> Dict[str, float]:
-    """Export adapter weights (using projected factors A_tilde, B_tilde for OPLoRA)."""
+def export_adapter_state(
+    model: nn.Module, save_path: str | Path, export_projected: bool = True
+) -> Dict[str, float]:
+    """
+    Export adapter weights. For OPLoRA, exports projected factors (A_tilde, B_tilde)
+    for inference and records export time and file size overhead.
+    """
     t0 = time.perf_counter()
     state = {}
     for name, module in model.named_modules():
@@ -185,14 +214,19 @@ def export_adapter_state(model: nn.Module, save_path: str | Path, export_project
     size_mb = path.stat().st_size / (1024 ** 2)
     return {"export_time_sec": export_time_sec, "checkpoint_size_mb": size_mb}
 
+
 @torch.no_grad()
 def merge_adapters_into_backbone(model: nn.Module) -> nn.Module:
-    """Merge LoRA/OPLoRA effective factors into base_layer weights in-place."""
+    """
+    Merge LoRA/OPLoRA effective factors into base_layer weights in-place and restore plain nn.Linear modules.
+    Uses projected factors (A_tilde, B_tilde) for OPLoRA.
+    """
     named_modules = dict(model.named_modules())
     for full_name, module in list(named_modules.items()):
         if isinstance(module, LoRALinear):
             delta_w = module.get_delta_weight().to(
-                dtype=module.base_layer.weight.dtype, device=module.base_layer.weight.device
+                dtype=module.base_layer.weight.dtype,
+                device=module.base_layer.weight.device,
             )
             module.base_layer.weight.data.add_(delta_w)
             parent_name = ".".join(full_name.split(".")[:-1])
@@ -201,28 +235,6 @@ def merge_adapters_into_backbone(model: nn.Module) -> nn.Module:
             setattr(parent, leaf_name, module.base_layer)
     return model
 
-@torch.no_grad()
-def load_exported_adapters_and_merge(
-    base_model: nn.Module,
-    adapter_ckpt_path: str | Path,
-) -> nn.Module:
-    """Load exported (projected) adapter factors into a fresh FP16 backbone copy and merge in-place."""
-    state = torch.load(adapter_ckpt_path, map_location="cpu")
-    named_modules = dict(base_model.named_modules())
-    for key, val in state.items():
-        if not key.endswith(".lora_A"):
-            continue
-        prefix = key[: -len(".lora_A")]
-        A_eff = val.to(torch.float32)
-        B_eff = state[f"{prefix}.lora_B"].to(torch.float32)
-        scaling = float(state[f"{prefix}.scaling"].item())
-        mod = named_modules[prefix]
-        target_lin = mod.base_layer if isinstance(mod, LoRALinear) else mod
-        delta_w = (scaling * torch.matmul(B_eff.to(target_lin.weight.device), A_eff.to(target_lin.weight.device))).to(
-            target_lin.weight.dtype
-        )
-        target_lin.weight.data.add_(delta_w)
-    return base_model
 
 @torch.no_grad()
 def verify_merged_vs_unmerged_logits(
@@ -231,13 +243,13 @@ def verify_merged_vs_unmerged_logits(
     input_ids: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
-    """Check merged versus unmerged logits on a small batch with dropout disabled."""
+    """Verify merged vs unmerged logits on a small batch with dropout disabled."""
     unmerged_model.eval()
     merged_model.eval()
-    out_u = unmerged_model(input_ids=input_ids, attention_mask=attention_mask)
-    out_m = merged_model(input_ids=input_ids, attention_mask=attention_mask)
-    logits_u = out_u.logits if hasattr(out_u, "logits") else out_u[0]
-    logits_m = out_m.logits if hasattr(out_m, "logits") else out_m[0]
+    out_unmerged = unmerged_model(input_ids=input_ids, attention_mask=attention_mask)
+    out_merged = merged_model(input_ids=input_ids, attention_mask=attention_mask)
+    logits_u = out_unmerged.logits if hasattr(out_unmerged, "logits") else out_unmerged[0]
+    logits_m = out_merged.logits if hasattr(out_merged, "logits") else out_merged[0]
     diff = (logits_u.float() - logits_m.float()).abs()
     return {
         "max_abs_logit_diff": float(diff.max().item()),

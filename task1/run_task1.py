@@ -1,6 +1,5 @@
 import argparse
 import copy
-import shutil
 from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -8,7 +7,11 @@ from datasets import load_dataset
 
 from common.seed_utils import set_all_seeds
 from common.logging_utils import save_json, load_json
-from task1.data_prep import select_metamath_40k, sample_activation_probe_ids
+from task1.data_prep import (
+    select_metamath_40k,
+    sample_activation_probe_ids,
+    apply_chat_template_to_ids,
+)
 from task1.adapters import (
     inject_adapters,
     compute_top_k_svd_bases,
@@ -33,25 +36,33 @@ from task1.plots_task1 import plot_task1_learning_curves, plot_task1_diagnostics
 MODEL_ID = "Qwen/Qwen3-0.6B"
 
 
+def load_qwen_backbone(dtype: torch.dtype, device: str = "cuda"):
+    """Load Qwen3-0.6B cleanly across both transformers 4.x and 5.x."""
+    try:
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=dtype)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=dtype)
+    return model.to(dtype=dtype, device=device)
+
+
 def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool = False):
-    """Load a trained checkpoint or adapter state into a fresh Qwen3-0.6B backbone."""
+    """Load a trained checkpoint or adapter state into a fresh Qwen3-0.6B backbone[cite: 3, 4]."""
     final_u = 2 if is_smoke else 1250
     mid_u = 1 if is_smoke else 625
 
     if condition == "baseline":
-        return AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
+        return load_qwen_backbone(torch.float16, device="cuda")
 
     if condition in ("full_ft_mid", "full_ft", "l2_sp"):
         var_folder = "full_ft" if condition.startswith("full_ft") else "l2_sp"
         u_num = mid_u if condition == "full_ft_mid" else final_u
         ckpt_path = out_dir / var_folder / "checkpoints" / f"checkpoint_update_{u_num}.pt"
-        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
+        model = load_qwen_backbone(torch.float32, device="cpu")
         ckpt = torch.load(ckpt_path, map_location="cpu")
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        return model.to(torch.float16).cuda()
+        return model.to(dtype=torch.float16, device="cuda")
 
-    # Adapter variants: lora_4, lora_16, oplora_16
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
+    model = load_qwen_backbone(torch.float16, device="cuda")
     r = 4 if condition == "lora_4" else 16
     alpha = 8.0 if condition == "lora_4" else 32.0
     use_oplora = condition == "oplora_16"
@@ -73,7 +84,7 @@ def main():
     parser.add_argument("--stage", type=str, choices=["smoke", "prep", "train", "eval_and_diag"], default="smoke")
     parser.add_argument("--variant", type=str, choices=["full_ft", "l2_sp", "lora_4", "lora_16", "oplora_16", "all"], default="all")
     parser.add_argument("--yaml-path", type=str, default="first_plot_questions.yaml")
-    parser.add_argument("--prune-optimizer-states", action="store_true", help="Remove heavy optimizer states after training to save Kaggle disk space")
+    parser.add_argument("--prune-optimizer-states", action="store_true")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -101,6 +112,7 @@ def main():
         retained, stats = select_metamath_40k(
             mm_ds, gsm8k_questions, tokenizer, target_count=target_examples, max_seq_len=2048
         )
+        print(f"[Data Prep] Retained {len(retained)} examples. Stats: {stats}")
         torch.save(retained, data_cache_path)
         save_json(stats, out_dir / "data_selection_stats.json")
         sample_activation_probe_ids(
@@ -119,9 +131,10 @@ def main():
     if args.stage in ("smoke", "train"):
         histories = {}
         for var in variants_to_run:
+            print(f"\n--- Training Variant: {var} ({total_updates} updates) ---")
             set_all_seeds(6304)
             if var in ("full_ft", "l2_sp"):
-                model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float32).cuda()
+                model = load_qwen_backbone(torch.float32, device="cuda")
                 res = train_task1_variant(
                     model=model,
                     examples=examples,
@@ -137,7 +150,7 @@ def main():
                     recovery_updates=recovery_updates,
                 )
             else:
-                model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
+                model = load_qwen_backbone(torch.float16, device="cuda")
                 r = 4 if var == "lora_4" else 16
                 alpha = 8.0 if var == "lora_4" else 32.0
                 use_oplora = var == "oplora_16"
@@ -166,7 +179,6 @@ def main():
                 del merged_copy
 
             if args.prune_optimizer_states:
-                # Strip optimizer states from recovery checkpoints (312, 937) after run completes to stay under Kaggle's 20GB limit
                 for u_drop in (312, 937):
                     p_drop = out_dir / var / "checkpoints" / f"checkpoint_update_{u_drop}.pt"
                     if p_drop.exists():
@@ -179,7 +191,7 @@ def main():
         plot_task1_learning_curves(histories, out_dir / "figures" / "task1_learning_curves.pdf")
 
     if args.stage in ("smoke", "eval_and_diag"):
-        base_model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
+        base_model = load_qwen_backbone(torch.float16, device="cuda")
         W0_dict = {
             l: get_down_proj_module(base_model, l).weight.detach().clone().float().cpu()
             for l in DIAGNOSTIC_LAYERS
@@ -194,9 +206,9 @@ def main():
         hswag_ds = load_dataset("Rowan/hellaswag", split="validation")
 
         math_prompts = [
-            tokenizer.apply_chat_template(
+            apply_chat_template_to_ids(
+                tokenizer,
                 [{"role": "user", "content": gsm8k_ds[i]["question"]}],
-                tokenize=True,
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
@@ -230,6 +242,7 @@ def main():
         weight_diag, act_diag = {}, {}
 
         for cond in all_conditions:
+            print(f"\n--- Evaluating & Diagnosing Condition: {cond} ---")
             model = load_trained_condition_model(cond, out_dir, is_smoke=is_smoke)
 
             if cond != "baseline":

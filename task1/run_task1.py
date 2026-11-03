@@ -1,3 +1,7 @@
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import gc
 import argparse
 import copy
 from pathlib import Path
@@ -46,7 +50,7 @@ def load_qwen_backbone(dtype: torch.dtype, device: str = "cuda"):
 
 
 def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool = False):
-    """Load a trained checkpoint or adapter state into a fresh Qwen3-0.6B backbone[cite: 3, 4]."""
+    """Load a trained checkpoint or adapter state into a fresh Qwen3-0.6B backbone."""
     final_u = 2 if is_smoke else 1250
     mid_u = 1 if is_smoke else 625
 
@@ -57,9 +61,11 @@ def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool =
         var_folder = "full_ft" if condition.startswith("full_ft") else "l2_sp"
         u_num = mid_u if condition == "full_ft_mid" else final_u
         ckpt_path = out_dir / var_folder / "checkpoints" / f"checkpoint_update_{u_num}.pt"
-        model = load_qwen_backbone(torch.float32, device="cpu")
+        model = load_qwen_backbone(torch.float16, device="cpu")
         ckpt = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        state_fp16 = {k: v.to(torch.float16) for k, v in ckpt["model_state_dict"].items()}
+        model.load_state_dict(state_fp16, strict=False)
+        del ckpt, state_fp16
         return model.to(dtype=torch.float16, device="cuda")
 
     model = load_qwen_backbone(torch.float16, device="cuda")
@@ -92,6 +98,7 @@ def main():
     set_all_seeds(6304)
 
     is_smoke = args.stage == "smoke"
+    prune_opt = args.prune_optimizer_states or is_smoke
     target_examples = 64 if is_smoke else 40000
     total_updates = 2 if is_smoke else 1250
     warmup_updates = 1 if is_smoke else 38
@@ -131,6 +138,8 @@ def main():
     if args.stage in ("smoke", "train"):
         histories = {}
         for var in variants_to_run:
+            gc.collect()
+            torch.cuda.empty_cache()
             print(f"\n--- Training Variant: {var} ({total_updates} updates) ---")
             set_all_seeds(6304)
             if var in ("full_ft", "l2_sp"):
@@ -148,6 +157,7 @@ def main():
                     is_adapter_run=False,
                     track_displacement=True,
                     recovery_updates=recovery_updates,
+                    prune_optimizer_states=prune_opt,
                 )
             else:
                 model = load_qwen_backbone(torch.float16, device="cuda")
@@ -171,6 +181,7 @@ def main():
                     track_displacement=False,
                     recovery_updates=recovery_updates,
                     adapter_meta=meta,
+                    prune_optimizer_states=prune_opt,
                 )
                 mb_ids = torch.tensor([examples[0]["input_ids"][:64]], dtype=torch.long, device="cuda")
                 merged_copy = merge_adapters_into_backbone(copy.deepcopy(model))
@@ -178,19 +189,16 @@ def main():
                 save_json(logit_diff, out_dir / var / "merged_logit_verification.json")
                 del merged_copy
 
-            if args.prune_optimizer_states:
-                for u_drop in (312, 937):
-                    p_drop = out_dir / var / "checkpoints" / f"checkpoint_update_{u_drop}.pt"
-                    if p_drop.exists():
-                        p_drop.unlink()
-
             histories[var] = res["history"]
             del model
+            gc.collect()
             torch.cuda.empty_cache()
 
         plot_task1_learning_curves(histories, out_dir / "figures" / "task1_learning_curves.pdf")
 
     if args.stage in ("smoke", "eval_and_diag"):
+        gc.collect()
+        torch.cuda.empty_cache()
         base_model = load_qwen_backbone(torch.float16, device="cuda")
         W0_dict = {
             l: get_down_proj_module(base_model, l).weight.detach().clone().float().cpu()
@@ -222,6 +230,7 @@ def main():
         Z_math = cache_starting_down_proj_activations(base_model, math_prompts, device="cuda")
         Z_nonmath = cache_starting_down_proj_activations(base_model, nonmath_prompts, device="cuda")
         del base_model
+        gc.collect()
         torch.cuda.empty_cache()
 
         prompts_24 = build_24_qualitative_prompts(args.yaml_path)
@@ -274,6 +283,7 @@ def main():
             qual_42.extend(q_out["annotated_first_last_6"])
 
             del model
+            gc.collect()
             torch.cuda.empty_cache()
 
         deltas_table = compute_benchmark_deltas_table(summaries, baseline_condition="baseline")

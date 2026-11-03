@@ -7,14 +7,28 @@ from common.logging_utils import save_json
 
 
 def patch_tokenizer_non_thinking(tokenizer: Any) -> Any:
-    """Ensure tokenizer.apply_chat_template defaults to enable_thinking=False during lm-eval."""
+    """
+    Ensure tokenizer.apply_chat_template defaults to enable_thinking=False[cite: 3] and
+    returns a flat List[int] (not a BatchEncoding dict) when tokenize=True in transformers 5.x.
+    """
+    if getattr(tokenizer, "_is_patched_non_thinking", False):
+        return tokenizer
+
     orig_fn = tokenizer.apply_chat_template
 
     def wrapped_apply_chat_template(*args, **kwargs):
         kwargs.setdefault("enable_thinking", False)
-        return orig_fn(*args, **kwargs)
+        want_dict = kwargs.get("return_dict", False)
+        if kwargs.get("tokenize", False) and not want_dict:
+            kwargs["return_dict"] = False
+        res = orig_fn(*args, **kwargs)
+        if kwargs.get("tokenize", False) and not want_dict:
+            if isinstance(res, dict) or hasattr(res, "keys"):
+                res = res["input_ids"]
+        return res
 
     tokenizer.apply_chat_template = wrapped_apply_chat_template
+    tokenizer._is_patched_non_thinking = True
     return tokenizer
 
 
@@ -27,8 +41,8 @@ def run_lm_eval_for_condition(
     limit: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Evaluate a model condition on GSM8K (generation, non-thinking chat template, greedy, 1024 cap)
-    and HellaSwag, BoolQ, ARC-Easy (candidate likelihood, stock completion prompts, no chat template).
+    Evaluate a model condition on GSM8K (generation, non-thinking chat template, greedy, 1024 cap)[cite: 3]
+    and HellaSwag, BoolQ, ARC-Easy (candidate likelihood, stock completion prompts, no chat template)[cite: 3].
     """
     import lm_eval
     from lm_eval.models.huggingface import HFLM
@@ -44,18 +58,18 @@ def run_lm_eval_for_condition(
         pretrained=model, tokenizer=tokenizer, batch_size=batch_size, max_length=2048
     )
 
-    # 1. GSM8K zero-shot generation with non-thinking chat template
+    # 1. GSM8K zero-shot generation with non-thinking chat template[cite: 3]
     gsm8k_res = lm_eval.simple_evaluate(
         model=hflm,
         tasks=["gsm8k_cot"],
         num_fewshot=0,
         apply_chat_template=True,
-        gen_kwargs="do_sample=False,temperature=0.0,max_gen_toks=1024",
+        gen_kwargs="do_sample=False,max_gen_toks=1024",
         log_samples=True,
         limit=limit,
     )
 
-    # 2. Likelihood benchmarks without chat template
+    # 2. Likelihood benchmarks without chat template[cite: 3]
     likelihood_res = lm_eval.simple_evaluate(
         model=hflm,
         tasks=["hellaswag", "boolq", "arc_easy"],
@@ -136,7 +150,7 @@ def compute_benchmark_deltas_table(
     summaries: List[Dict[str, Any]],
     baseline_condition: str = "baseline",
 ) -> List[Dict[str, Any]]:
-    """Compute percentage-point changes (Delta pp) relative to the shared baseline condition."""
+    """Compute percentage-point changes (Delta pp) relative to the shared baseline condition[cite: 4, 5]."""
     base = next(
         (s for s in summaries if s["condition"] == baseline_condition), summaries[0]
     )

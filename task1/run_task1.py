@@ -1,5 +1,6 @@
 import argparse
 import copy
+import shutil
 from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -13,7 +14,7 @@ from task1.adapters import (
     compute_top_k_svd_bases,
     merge_adapters_into_backbone,
     verify_merged_vs_unmerged_logits,
-    TASK1_TARGET_MODULES,
+    LoRALinear,
 )
 from task1.trainer import train_task1_variant
 from task1.evaluate_harness import run_lm_eval_for_condition, compute_benchmark_deltas_table
@@ -32,12 +33,38 @@ from task1.plots_task1 import plot_task1_learning_curves, plot_task1_diagnostics
 MODEL_ID = "Qwen/Qwen3-0.6B"
 
 
-def precompute_all_svd_bases(model, k: int = 128):
-    bases = {}
+def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool = False):
+    """Load a trained checkpoint or adapter state into a fresh Qwen3-0.6B backbone."""
+    final_u = 2 if is_smoke else 1250
+    mid_u = 1 if is_smoke else 625
+
+    if condition == "baseline":
+        return AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
+
+    if condition in ("full_ft_mid", "full_ft", "l2_sp"):
+        var_folder = "full_ft" if condition.startswith("full_ft") else "l2_sp"
+        u_num = mid_u if condition == "full_ft_mid" else final_u
+        ckpt_path = out_dir / var_folder / "checkpoints" / f"checkpoint_update_{u_num}.pt"
+        model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        return model.to(torch.float16).cuda()
+
+    # Adapter variants: lora_4, lora_16, oplora_16
+    model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
+    r = 4 if condition == "lora_4" else 16
+    alpha = 8.0 if condition == "lora_4" else 32.0
+    use_oplora = condition == "oplora_16"
+    inject_adapters(
+        model, r=r, alpha=alpha, dropout=0.05, use_oplora=use_oplora, protection_rank_k=128, init_seed=6304
+    )
+    adapter_path = out_dir / condition / "checkpoints" / f"adapter_update_{final_u}.pt"
+    state = torch.load(adapter_path, map_location="cuda")
     for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Linear) and name.split(".")[-1] in TASK1_TARGET_MODULES:
-            bases[name] = compute_top_k_svd_bases(module.weight.data, k=k)
-    return bases
+        if isinstance(module, LoRALinear):
+            module.lora_A.data.copy_(state[f"{name}.lora_A"].to(module.lora_A.device))
+            module.lora_B.data.copy_(state[f"{name}.lora_B"].to(module.lora_B.device))
+    return model
 
 
 def main():
@@ -46,6 +73,7 @@ def main():
     parser.add_argument("--stage", type=str, choices=["smoke", "prep", "train", "eval_and_diag"], default="smoke")
     parser.add_argument("--variant", type=str, choices=["full_ft", "l2_sp", "lora_4", "lora_16", "oplora_16", "all"], default="all")
     parser.add_argument("--yaml-path", type=str, default="first_plot_questions.yaml")
+    parser.add_argument("--prune-optimizer-states", action="store_true", help="Remove heavy optimizer states after training to save Kaggle disk space")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -56,6 +84,7 @@ def main():
     target_examples = 64 if is_smoke else 40000
     total_updates = 2 if is_smoke else 1250
     warmup_updates = 1 if is_smoke else 38
+    recovery_updates = (1, 2) if is_smoke else (312, 625, 937, 1250)
     eval_limit = 8 if is_smoke else None
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -105,6 +134,7 @@ def main():
                     pad_token_id=tokenizer.pad_token_id,
                     is_adapter_run=False,
                     track_displacement=True,
+                    recovery_updates=recovery_updates,
                 )
             else:
                 model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
@@ -126,14 +156,21 @@ def main():
                     pad_token_id=tokenizer.pad_token_id,
                     is_adapter_run=True,
                     track_displacement=False,
+                    recovery_updates=recovery_updates,
                     adapter_meta=meta,
                 )
-                # Verify merged vs unmerged logits on a 2-sequence microbatch
                 mb_ids = torch.tensor([examples[0]["input_ids"][:64]], dtype=torch.long, device="cuda")
                 merged_copy = merge_adapters_into_backbone(copy.deepcopy(model))
                 logit_diff = verify_merged_vs_unmerged_logits(model, merged_copy, mb_ids)
                 save_json(logit_diff, out_dir / var / "merged_logit_verification.json")
                 del merged_copy
+
+            if args.prune_optimizer_states:
+                # Strip optimizer states from recovery checkpoints (312, 937) after run completes to stay under Kaggle's 20GB limit
+                for u_drop in (312, 937):
+                    p_drop = out_dir / var / "checkpoints" / f"checkpoint_update_{u_drop}.pt"
+                    if p_drop.exists():
+                        p_drop.unlink()
 
             histories[var] = res["history"]
             del model
@@ -142,7 +179,6 @@ def main():
         plot_task1_learning_curves(histories, out_dir / "figures" / "task1_learning_curves.pdf")
 
     if args.stage in ("smoke", "eval_and_diag"):
-        # Load baseline model once to cache W_0, U_k, and starting down_proj activations Z
         base_model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16).cuda()
         W0_dict = {
             l: get_down_proj_module(base_model, l).weight.detach().clone().float().cpu()
@@ -173,24 +209,71 @@ def main():
 
         Z_math = cache_starting_down_proj_activations(base_model, math_prompts, device="cuda")
         Z_nonmath = cache_starting_down_proj_activations(base_model, nonmath_prompts, device="cuda")
+        del base_model
+        torch.cuda.empty_cache()
 
         prompts_24 = build_24_qualitative_prompts(args.yaml_path)
         if is_smoke:
             prompts_24 = [p for p in prompts_24 if p["question_index"] in (0, 7)]
 
-        # Evaluate Baseline
+        all_conditions = [
+            "baseline",
+            "full_ft_mid",
+            "full_ft",
+            "l2_sp",
+            "lora_4",
+            "lora_16",
+            "oplora_16",
+        ]
         summaries = []
-        summaries.append(
-            run_lm_eval_for_condition(base_model, tokenizer, "baseline", out_dir / "eval", limit=eval_limit)
-        )
         qual_all, qual_42 = [], []
-        q_base = generate_qualitative_suite(base_model, tokenizer, "baseline", prompts_24)
-        qual_all.extend(q_base["all_24"])
-        qual_42.extend(q_base["annotated_first_last_6"])
+        weight_diag, act_diag = {}, {}
 
+        for cond in all_conditions:
+            model = load_trained_condition_model(cond, out_dir, is_smoke=is_smoke)
+
+            if cond != "baseline":
+                weight_diag[cond] = {}
+                act_diag[cond] = {}
+                for l in DIAGNOSTIC_LAYERS:
+                    mod_l = get_down_proj_module(model, l)
+                    dW = extract_effective_down_proj_delta_w(mod_l, W0_dict[l]).cpu()
+                    weight_diag[cond][l] = compute_weight_space_diagnostics(
+                        W0_dict[l], dW, U_k_fp32=Uk_dict[l], k=128
+                    )
+                    act_diag[cond][l] = {
+                        "math": compute_activation_perturbation_ratios(W0_dict[l], dW, Z_math[l]),
+                        "non_math": compute_activation_perturbation_ratios(W0_dict[l], dW, Z_nonmath[l]),
+                    }
+
+            if cond in ("lora_4", "lora_16", "oplora_16"):
+                model = merge_adapters_into_backbone(model)
+
+            s = run_lm_eval_for_condition(
+                model, tokenizer, cond, out_dir / "eval", batch_size=8, limit=eval_limit
+            )
+            summaries.append(s)
+
+            q_out = generate_qualitative_suite(
+                model, tokenizer, cond, prompts_24, max_new_tokens=(64 if is_smoke else 512)
+            )
+            qual_all.extend(q_out["all_24"])
+            qual_42.extend(q_out["annotated_first_last_6"])
+
+            del model
+            torch.cuda.empty_cache()
+
+        deltas_table = compute_benchmark_deltas_table(summaries, baseline_condition="baseline")
         save_json(summaries, out_dir / "eval" / "all_benchmark_summaries.json")
+        save_json(deltas_table, out_dir / "eval" / "benchmark_deltas_table.json")
+        save_json(weight_diag, out_dir / "eval" / "weight_space_diagnostics.json")
+        save_json(act_diag, out_dir / "eval" / "activation_diagnostics.json")
         save_json(qual_all, out_dir / "eval" / "qualitative_168.json")
         save_json(qual_42, out_dir / "eval" / "qualitative_42_subset.json")
+
+        plot_task1_diagnostics(
+            weight_diag, act_diag, out_dir / "figures" / "task1_diagnostics.pdf"
+        )
 
 
 if __name__ == "__main__":

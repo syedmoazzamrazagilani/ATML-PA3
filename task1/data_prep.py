@@ -17,6 +17,50 @@ def normalize_question_text(text: str) -> str:
     return text.strip()
 
 
+def apply_chat_template_to_ids(
+    tokenizer: Any,
+    messages: List[Dict[str, str]],
+    add_generation_prompt: bool = True,
+    enable_thinking: bool = False,
+) -> List[int]:
+    """
+    Safely invoke tokenizer.apply_chat_template and always return a flat List[int],
+    handling both transformers 4.x (List[int]) and transformers 5.x (BatchEncoding dict).
+    """
+    try:
+        raw = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            return_dict=False,
+        )
+    except TypeError:
+        try:
+            raw = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            # Fallback for mock tokenizers
+            text = ""
+            for m in messages:
+                text += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+            if add_generation_prompt:
+                text += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            raw = tokenizer.encode(text, add_special_tokens=False)
+
+    if isinstance(raw, dict) or hasattr(raw, "keys"):
+        raw = raw["input_ids"]
+    if hasattr(raw, "tolist"):
+        raw = raw.tolist()
+    if isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], list):
+        raw = raw[0]
+    return [int(x) for x in raw]
+
+
 def format_sft_example(
     tokenizer: Any,
     question: str,
@@ -25,10 +69,10 @@ def format_sft_example(
 ) -> Dict[str, Any] | None:
     """
     Format a user question and supplied assistant response using Qwen3's chat template
-    with thinking disabled (enable_thinking=False).
+    with thinking disabled (enable_thinking=False)[cite: 3].
     Computes next-token cross-entropy only on assistant-response tokens and the
-    end-of-turn token (<|im_end|>); masks prompts and trailing newlines with -100.
-    Returns None if empty or formatted length > max_seq_len (never truncates).
+    end-of-turn token (<|im_end|>); masks prompts and trailing newlines with -100[cite: 3].
+    Returns None if empty or formatted length > max_seq_len (never truncates)[cite: 3].
     """
     if not question or not question.strip() or not response or not response.strip():
         return None
@@ -39,35 +83,20 @@ def format_sft_example(
         {"role": "assistant", "content": response},
     ]
 
-    try:
-        prompt_ids = tokenizer.apply_chat_template(
-            prompt_msgs,
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        full_ids = tokenizer.apply_chat_template(
-            full_msgs,
-            tokenize=True,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
-    except TypeError:
-        prompt_str = (
-            f"<|im_start|>user\n{question}<|im_end|>\n"
-            f"<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        )
-        full_str = f"{prompt_str}{response}<|im_end|>\n"
-        prompt_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
-        full_ids = tokenizer.encode(full_str, add_special_tokens=False)
+    prompt_ids = apply_chat_template_to_ids(
+        tokenizer, prompt_msgs, add_generation_prompt=True, enable_thinking=False
+    )
+    full_ids = apply_chat_template_to_ids(
+        tokenizer, full_msgs, add_generation_prompt=False, enable_thinking=False
+    )
 
-    if len(full_ids) > max_seq_len:
+    if len(full_ids) > max_seq_len or len(full_ids) <= len(prompt_ids):
         return None
 
     prompt_len = len(prompt_ids)
     labels = [-100] * prompt_len + list(full_ids[prompt_len:])
 
-    # Ensure supervision stops at the end-of-turn token (<|im_end|>)
+    # Ensure supervision stops at the end-of-turn token (<|im_end|>)[cite: 3]
     im_end_id = getattr(tokenizer, "eos_token_id", None)
     if hasattr(tokenizer, "convert_tokens_to_ids"):
         try:
@@ -102,9 +131,9 @@ def select_metamath_40k(
     max_seq_len: int = 2048,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
-    Select the first 40,000 eligible examples from MetaMathQA in source order.
+    Select the first 40,000 eligible examples from MetaMathQA in source order[cite: 3].
     Excludes empty questions/responses, formatted length > 2048 tokens, or
-    query/original_question matching any GSM8K test question after normalization.
+    query/original_question matching any GSM8K test question after normalization[cite: 3].
     """
     gsm8k_norm_set = {normalize_question_text(q) for q in gsm8k_test_questions if q}
     retained: List[Dict[str, Any]] = []
@@ -145,6 +174,11 @@ def select_metamath_40k(
         if len(retained) >= target_count:
             break
 
+    if len(retained) < target_count:
+        raise RuntimeError(
+            f"Only retained {len(retained)}/{target_count} examples! Stats: {stats}"
+        )
+
     return retained, stats
 
 
@@ -155,7 +189,7 @@ def sample_activation_probe_ids(
     seed: int = 6304,
     save_path: str | Path | None = None,
 ) -> Dict[str, Any]:
-    """Sample 32 GSM8K test questions and 32 HellaSwag validation contexts using seed 6304."""
+    """Sample 32 GSM8K test questions and 32 HellaSwag validation contexts using seed 6304[cite: 3]."""
     rng = np.random.default_rng(seed)
     gsm8k_ids = sorted(
         rng.choice(num_gsm8k, size=min(sample_size, num_gsm8k), replace=False).tolist()
@@ -190,7 +224,7 @@ class SFTDataset(Dataset):
 def collate_sft_batch(
     batch: List[Dict[str, Any]], pad_token_id: int = 0
 ) -> Dict[str, torch.Tensor]:
-    """Right-pad microbatch of SFT examples, masking padded labels with -100."""
+    """Right-pad microbatch of SFT examples, masking padded labels with -100[cite: 3]."""
     max_len = max(len(ex["input_ids"]) for ex in batch)
     input_ids, labels, attention_mask = [], [], []
     valid_tokens = 0

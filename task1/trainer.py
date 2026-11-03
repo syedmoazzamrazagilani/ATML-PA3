@@ -21,7 +21,7 @@ def build_adamw_optimizer(
     betas: Tuple[float, float] = (0.9, 0.999),
     eps: float = 1e-8,
 ) -> torch.optim.AdamW:
-    """Build AdamW with weight_decay=0.01, excluding biases and parameters with < 2 dimensions."""
+    """Build AdamW with weight_decay=0.01, excluding biases and parameters with < 2 dimensions[cite: 3]."""
     decay_params = []
     no_decay_params = []
     seen_ptrs = set()
@@ -49,7 +49,7 @@ def build_cosine_warmup_scheduler(
     total_updates: int = 1250,
     min_lr_ratio: float = 0.0,
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Linear warmup for `warmup_updates` steps, then cosine decay."""
+    """Linear warmup for `warmup_updates` steps, then cosine decay[cite: 3]."""
     def lr_lambda(current_step: int) -> float:
         if current_step < warmup_updates:
             return float(current_step + 1) / float(max(1, warmup_updates))
@@ -68,8 +68,8 @@ def snapshot_starting_parameters(
     model: nn.Module, device: torch.device | str
 ) -> Tuple[List[torch.Tensor], Dict[str, float]]:
     """
-    Snapshot unique starting parameters theta_0 for L2-SP and displacement calculation.
-    Counts tied parameters once via data_ptr(). Tracks reference storage and transfer overhead.
+    Snapshot unique starting parameters theta_0 for L2-SP and displacement calculation[cite: 4].
+    Counts tied parameters once via data_ptr()[cite: 4].
     """
     t0 = time.perf_counter()
     seen_ptrs = set()
@@ -95,8 +95,8 @@ def compute_l2_sp_penalty(
 ) -> torch.Tensor:
     """
     Compute Omega(theta, theta_0) = 0.5 * sum_j (theta_j - theta_{0,j})^2 over all unique parameters,
-    including biases and normalization parameters, counting tied parameters once.
-    Does NOT average Omega over parameters.
+    including biases and normalization parameters, counting tied parameters once[cite: 2, 4].
+    Does NOT average Omega over parameters[cite: 4].
     """
     seen_ptrs = set()
     unique_params = []
@@ -117,7 +117,7 @@ def compute_l2_sp_penalty(
 def compute_model_displacement_l2(
     model: nn.Module, theta0_list: List[torch.Tensor]
 ) -> float:
-    """Compute full-model L2 displacement ||theta - theta_0||_2 = sqrt(2 * Omega(theta, theta_0))."""
+    """Compute full-model L2 displacement ||theta - theta_0||_2 = sqrt(2 * Omega(theta, theta_0))[cite: 4]."""
     omega = compute_l2_sp_penalty(model, theta0_list)
     return float(torch.sqrt(2.0 * omega).item())
 
@@ -125,10 +125,7 @@ def compute_model_displacement_l2(
 def compute_microbatch_token_sum_ce(
     logits: torch.Tensor, labels: torch.Tensor
 ) -> torch.Tensor:
-    """
-    Compute summed next-token cross-entropy over valid assistant-response + EOT tokens in a microbatch.
-    Caller normalizes over all valid response tokens in the 32-example effective batch.
-    """
+    """Compute summed next-token cross-entropy over valid assistant-response + EOT tokens[cite: 3]."""
     shift_logits = logits[..., :-1, :].contiguous().float()
     shift_labels = labels[..., 1:].contiguous()
     return F.cross_entropy(
@@ -160,9 +157,14 @@ def train_task1_variant(
     resume_from: Optional[str | Path] = None,
     adapter_meta: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
-    """
-    Unified Task 1 trainer supporting Full FT, Full FT + L2-SP, LoRA-4, LoRA-16, and OPLoRA-16.
-    """
+    """Unified Task 1 trainer supporting Full FT, Full FT + L2-SP, LoRA-4, LoRA-16, and OPLoRA-16[cite: 3, 4]."""
+    effective_batch_size = microbatch_size * grad_accum_steps
+    if len(examples) < effective_batch_size * total_updates:
+        raise ValueError(
+            f"Insufficient examples ({len(examples)}) for {total_updates} updates "
+            f"with effective_batch_size={effective_batch_size}!"
+        )
+
     set_all_seeds(seed)
     out_dir = Path(output_dir) / variant_name
     ckpt_dir = out_dir / "checkpoints"
@@ -173,7 +175,12 @@ def train_task1_variant(
     use_cuda_amp = device.type == "cuda"
 
     if hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
     if is_adapter_run and hasattr(model, "enable_input_require_grads"):
         model.enable_input_require_grads()
 
@@ -186,7 +193,10 @@ def train_task1_variant(
     scheduler = build_cosine_warmup_scheduler(
         optimizer, warmup_updates=warmup_updates, total_updates=total_updates
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_cuda_amp)
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=use_cuda_amp)
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler(enabled=use_cuda_amp)
 
     start_update = 0
     skipped_updates = 0
@@ -200,7 +210,6 @@ def train_task1_variant(
         start_update = int(ckpt["update"])
         skipped_updates = int(ckpt.get("skipped_updates", 0))
 
-    effective_batch_size = microbatch_size * grad_accum_steps
     reset_peak_gpu_memory()
     model.train()
     t_start = time.perf_counter()
@@ -237,7 +246,7 @@ def train_task1_variant(
             with torch.amp.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=use_cuda_amp
             ):
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
                 logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
                 mb_loss_sum = compute_microbatch_token_sum_ce(logits, labels)
                 mb_loss = mb_loss_sum / float(total_valid_tokens)
@@ -254,7 +263,6 @@ def train_task1_variant(
             omega_val = float(omega_tensor.detach().item())
             reg_val = float(reg_tensor.detach().item())
 
-        # Unscale FP32 gradients before global norm 1.0 clipping
         scaler.unscale_(optimizer)
         grad_norm = float(
             torch.nn.utils.clip_grad_norm_(

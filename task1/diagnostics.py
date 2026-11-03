@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from task1.data_prep import apply_chat_template_to_ids
 from task1.adapters import compute_top_k_svd_bases, LoRALinear
 
 DIAGNOSTIC_LAYERS = (0, 13, 27)
@@ -44,8 +45,8 @@ def build_24_qualitative_prompts(
     yaml_path: Optional[str | Path] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Load all 24 qualitative evaluation prompts from first_plot_questions.yaml
-    (8 underlying questions in plain, JSON, and template formats).
+    Load all 24 qualitative evaluation prompts from first_plot_questions.yaml[cite: 3]
+    (8 underlying questions in plain, JSON, and template formats)[cite: 3].
     """
     if yaml_path is not None and Path(yaml_path).exists():
         try:
@@ -122,7 +123,7 @@ def build_24_qualitative_prompts(
 
 
 def get_down_proj_module(model: nn.Module, layer_idx: int) -> nn.Module:
-    """Retrieve mlp.down_proj module for transformer layer `layer_idx`."""
+    """Retrieve mlp.down_proj module for transformer layer `layer_idx`[cite: 5]."""
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         return model.model.layers[layer_idx].mlp.down_proj
     if hasattr(model, "layers"):
@@ -136,8 +137,8 @@ def extract_effective_down_proj_delta_w(
     W0_fp32: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Return Delta W in FP32 for a layer's down_proj module.
-    Uses projected factors (A_tilde, B_tilde) for OPLoRA, or W_trained - W_0 for Full FT / L2-SP.
+    Return Delta W in FP32 for a layer's down_proj module[cite: 5].
+    Uses projected factors (A_tilde, B_tilde) for OPLoRA, or W_trained - W_0 for Full FT / L2-SP[cite: 5].
     """
     if isinstance(trained_module, LoRALinear):
         return trained_module.get_delta_weight().detach().to(torch.float32)
@@ -154,7 +155,7 @@ def compute_weight_space_diagnostics(
     k: int = 128,
 ) -> Dict[str, float]:
     """
-    Compute weight-space diagnostics in FP32:
+    Compute weight-space diagnostics in FP32[cite: 5]:
       rho_k = ||U_k U_k^T Delta W||_F^2 / ||Delta W||_F^2
       eta   = ||Delta W||_F / ||W_0||_F
     """
@@ -188,13 +189,13 @@ def compute_weight_space_diagnostics(
 @torch.no_grad()
 def cache_starting_down_proj_activations(
     base_model: nn.Module,
-    prompt_token_ids_list: List[List[int]],
+    prompt_token_ids_list: List[Any],
     layer_indices: Tuple[int, ...] = DIAGNOSTIC_LAYERS,
     device: str | torch.device = "cpu",
 ) -> Dict[int, torch.Tensor]:
     """
     Register forward pre-hooks on base_model's down_proj in layers 0, 13, 27 to cache input z
-    at the LAST non-padding prompt token, before any answer continuation.
+    at the LAST non-padding prompt token, before any answer continuation[cite: 5].
     """
     base_model.eval()
     cached: Dict[int, List[torch.Tensor]] = {l: [] for l in layer_indices}
@@ -220,9 +221,16 @@ def cache_starting_down_proj_activations(
 
     try:
         for seq in prompt_token_ids_list:
-            inp = torch.tensor([seq], dtype=torch.long, device=device)
-            current_last_idx[0] = len(seq) - 1
-            _ = base_model(input_ids=inp)
+            if isinstance(seq, dict) or hasattr(seq, "keys"):
+                seq = seq["input_ids"]
+            if hasattr(seq, "tolist"):
+                seq = seq.tolist()
+            if isinstance(seq, list) and len(seq) > 0 and isinstance(seq[0], list):
+                seq = seq[0]
+            seq_ints = [int(x) for x in seq]
+            inp = torch.tensor([seq_ints], dtype=torch.long, device=device)
+            current_last_idx[0] = len(seq_ints) - 1
+            _ = base_model(input_ids=inp, use_cache=False)
     finally:
         for h in hooks:
             h.remove()
@@ -236,9 +244,7 @@ def compute_activation_perturbation_ratios(
     delta_W_fp32: torch.Tensor,
     Z_cached_fp32: torch.Tensor,
 ) -> Dict[str, Any]:
-    """
-    Compute R(z) = ||Delta W z||_2 / (||W_0 z||_2 + 1e-8) in FP32 on cached inputs Z (N x d_in).
-    """
+    """Compute R(z) = ||Delta W z||_2 / (||W_0 z||_2 + 1e-8) in FP32 on cached inputs Z (N x d_in)[cite: 5]."""
     W0 = W0_fp32.to(torch.float32)
     dW = delta_W_fp32.to(device=W0.device, dtype=torch.float32)
     Z = Z_cached_fp32.to(device=W0.device, dtype=torch.float32)
@@ -267,7 +273,7 @@ def annotate_qualitative_response(
 ) -> Dict[str, Any]:
     """
     Annotate a generated response for format compliance, coherence/repetition,
-    unnecessary mathematical framing, inappropriate content, and truncation.
+    unnecessary mathematical framing, inappropriate content, and truncation[cite: 5].
     """
     fmt = prompt_meta["format"]
     text_stripped = response_text.strip()
@@ -339,8 +345,8 @@ def generate_qualitative_suite(
     max_new_tokens: int = 512,
 ) -> Dict[str, Any]:
     """
-    Generate 1 greedy response per prompt with thinking disabled and a 512-new-token cap.
-    Extracts the 42-response annotation subset (first and last underlying questions: indices 0 and 7).
+    Generate 1 greedy response per prompt with thinking disabled and a 512-new-token cap[cite: 5].
+    Extracts the 42-response annotation subset (first and last underlying questions: indices 0 and 7)[cite: 5].
     """
     model.eval()
     device = next(model.parameters()).device
@@ -349,23 +355,14 @@ def generate_qualitative_suite(
 
     for p in prompts_24:
         msgs = [{"role": "user", "content": p["prompt"]}]
-        try:
-            inp_ids = tokenizer.apply_chat_template(
-                msgs,
-                tokenize=True,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        except TypeError:
-            prompt_str = (
-                f"<|im_start|>user\n{p['prompt']}<|im_end|>\n"
-                f"<|im_start|>assistant\n<think>\n\n</think>\n\n"
-            )
-            inp_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
-
+        inp_ids = apply_chat_template_to_ids(
+            tokenizer, msgs, add_generation_prompt=True, enable_thinking=False
+        )
         inp_tensor = torch.tensor([inp_ids], dtype=torch.long, device=device)
+        attn_mask = torch.ones_like(inp_tensor)
         out_ids = model.generate(
             input_ids=inp_tensor,
+            attention_mask=attn_mask,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=getattr(tokenizer, "pad_token_id", 0) or 0,

@@ -2,6 +2,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import gc
+import json
 import argparse
 import copy
 from pathlib import Path
@@ -38,6 +39,33 @@ from task1.diagnostics import (
 from task1.plots_task1 import plot_task1_learning_curves, plot_task1_diagnostics
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
+ALL_VARIANTS = ["full_ft", "l2_sp", "lora_4", "lora_16", "oplora_16"]
+ALL_CONDITIONS = [
+    "baseline",
+    "full_ft_mid",
+    "full_ft",
+    "l2_sp",
+    "lora_4",
+    "lora_16",
+    "oplora_16",
+]
+
+
+def load_all_histories_from_disk(out_dir: Path) -> dict:
+    """Load step-by-step training logs from train_log.jsonl across all 5 variants on disk."""
+    histories = {}
+    for var in ALL_VARIANTS:
+        log_path = out_dir / var / "train_log.jsonl"
+        if log_path.exists():
+            rows = []
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        rows.append(json.loads(line))
+            if rows:
+                histories[var] = rows
+    return histories
 
 
 def load_qwen_backbone(dtype: torch.dtype, device: str = "cuda"):
@@ -55,7 +83,9 @@ def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool =
     mid_u = 1 if is_smoke else 625
 
     if condition == "baseline":
-        return load_qwen_backbone(torch.float16, device="cuda")
+        model = load_qwen_backbone(torch.float16, device="cuda")
+        model.config.use_cache = True
+        return model
 
     if condition in ("full_ft_mid", "full_ft", "l2_sp"):
         var_folder = "full_ft" if condition.startswith("full_ft") else "l2_sp"
@@ -66,7 +96,9 @@ def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool =
         state_fp16 = {k: v.to(torch.float16) for k, v in ckpt["model_state_dict"].items()}
         model.load_state_dict(state_fp16, strict=False)
         del ckpt, state_fp16
-        return model.to(dtype=torch.float16, device="cuda")
+        model = model.to(dtype=torch.float16, device="cuda")
+        model.config.use_cache = True
+        return model
 
     model = load_qwen_backbone(torch.float16, device="cuda")
     r = 4 if condition == "lora_4" else 16
@@ -81,6 +113,7 @@ def load_trained_condition_model(condition: str, out_dir: Path, is_smoke: bool =
         if isinstance(module, LoRALinear):
             module.lora_A.data.copy_(state[f"{name}.lora_A"].to(module.lora_A.device))
             module.lora_B.data.copy_(state[f"{name}.lora_B"].to(module.lora_B.device))
+    model.config.use_cache = True
     return model
 
 
@@ -89,6 +122,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="/kaggle/working/task1_outputs")
     parser.add_argument("--stage", type=str, choices=["smoke", "prep", "train", "eval_and_diag"], default="smoke")
     parser.add_argument("--variant", type=str, choices=["full_ft", "l2_sp", "lora_4", "lora_16", "oplora_16", "all"], default="all")
+    parser.add_argument("--eval-batch-size", type=int, default=16)
     parser.add_argument("--yaml-path", type=str, default="first_plot_questions.yaml")
     parser.add_argument("--prune-optimizer-states", action="store_true")
     args = parser.parse_args()
@@ -129,22 +163,22 @@ def main():
             return
 
     examples = torch.load(data_cache_path)
-    variants_to_run = (
-        ["full_ft", "l2_sp", "lora_4", "lora_16", "oplora_16"]
-        if args.variant == "all"
-        else [args.variant]
-    )
+    variants_to_run = ALL_VARIANTS if args.variant == "all" else [args.variant]
 
     if args.stage in ("smoke", "train"):
-        histories = {}
         for var in variants_to_run:
+            # Clear any partial train_log.jsonl if restarting an unfinished variant from step 0
+            var_log = out_dir / var / "train_log.jsonl"
+            if var_log.exists() and not (out_dir / var / "run_summary.json").exists():
+                var_log.unlink()
+
             gc.collect()
             torch.cuda.empty_cache()
             print(f"\n--- Training Variant: {var} ({total_updates} updates) ---")
             set_all_seeds(6304)
             if var in ("full_ft", "l2_sp"):
                 model = load_qwen_backbone(torch.float32, device="cuda")
-                res = train_task1_variant(
+                train_task1_variant(
                     model=model,
                     examples=examples,
                     variant_name=var,
@@ -167,7 +201,7 @@ def main():
                 meta = inject_adapters(
                     model, r=r, alpha=alpha, dropout=0.05, use_oplora=use_oplora, protection_rank_k=128, init_seed=6304
                 )
-                res = train_task1_variant(
+                train_task1_variant(
                     model=model,
                     examples=examples,
                     variant_name=var,
@@ -189,12 +223,18 @@ def main():
                 save_json(logit_diff, out_dir / var / "merged_logit_verification.json")
                 del merged_copy
 
-            histories[var] = res["history"]
+                if prune_opt:
+                    for u_drop in (312, 625, 937, 1250):
+                        p_drop = out_dir / var / "checkpoints" / f"checkpoint_update_{u_drop}.pt"
+                        if p_drop.exists():
+                            p_drop.unlink()
+
             del model
             gc.collect()
             torch.cuda.empty_cache()
 
-        plot_task1_learning_curves(histories, out_dir / "figures" / "task1_learning_curves.pdf")
+        all_histories = load_all_histories_from_disk(out_dir)
+        plot_task1_learning_curves(all_histories, out_dir / "figures" / "task1_learning_curves.pdf")
 
     if args.stage in ("smoke", "eval_and_diag"):
         gc.collect()
@@ -237,20 +277,28 @@ def main():
         if is_smoke:
             prompts_24 = [p for p in prompts_24 if p["question_index"] in (0, 7)]
 
-        all_conditions = [
-            "baseline",
-            "full_ft_mid",
-            "full_ft",
-            "l2_sp",
-            "lora_4",
-            "lora_16",
-            "oplora_16",
-        ]
         summaries = []
         qual_all, qual_42 = [], []
         weight_diag, act_diag = {}, {}
 
-        for cond in all_conditions:
+        for cond in ALL_CONDITIONS:
+            cond_eval_dir = out_dir / "eval" / cond
+            cond_summary_path = cond_eval_dir / "benchmark_summary.json"
+            cond_qual_path = cond_eval_dir / "qualitative_out.json"
+            cond_diag_path = cond_eval_dir / "diagnostics_out.json"
+
+            if not is_smoke and cond_summary_path.exists() and cond_qual_path.exists():
+                print(f"\n--- Condition '{cond}' already evaluated on disk; loading cached results ---")
+                summaries.append(load_json(cond_summary_path))
+                q_out = load_json(cond_qual_path)
+                qual_all.extend(q_out["all_24"])
+                qual_42.extend(q_out["annotated_first_last_6"])
+                if cond != "baseline" and cond_diag_path.exists():
+                    d_out = load_json(cond_diag_path)
+                    weight_diag[cond] = {int(k): v for k, v in d_out["weight_diag"].items()}
+                    act_diag[cond] = {int(k): v for k, v in d_out["act_diag"].items()}
+                continue
+
             print(f"\n--- Evaluating & Diagnosing Condition: {cond} ---")
             model = load_trained_condition_model(cond, out_dir, is_smoke=is_smoke)
 
@@ -267,18 +315,29 @@ def main():
                         "math": compute_activation_perturbation_ratios(W0_dict[l], dW, Z_math[l]),
                         "non_math": compute_activation_perturbation_ratios(W0_dict[l], dW, Z_nonmath[l]),
                     }
+                save_json(
+                    {"weight_diag": weight_diag[cond], "act_diag": act_diag[cond]},
+                    cond_diag_path,
+                )
 
             if cond in ("lora_4", "lora_16", "oplora_16"):
                 model = merge_adapters_into_backbone(model)
 
+            model.config.use_cache = True
             s = run_lm_eval_for_condition(
-                model, tokenizer, cond, out_dir / "eval", batch_size=8, limit=eval_limit
+                model,
+                tokenizer,
+                cond,
+                out_dir / "eval",
+                batch_size=args.eval_batch_size,
+                limit=eval_limit,
             )
             summaries.append(s)
 
             q_out = generate_qualitative_suite(
                 model, tokenizer, cond, prompts_24, max_new_tokens=(64 if is_smoke else 512)
             )
+            save_json(q_out, cond_qual_path)
             qual_all.extend(q_out["all_24"])
             qual_42.extend(q_out["annotated_first_last_6"])
 

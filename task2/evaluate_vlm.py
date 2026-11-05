@@ -174,7 +174,7 @@ def compute_paired_bootstrap_cis(
         for c in conds
     }
 
-    boot_ indices = rng.integers(0, n_pairs, size=(num_resamples, n_pairs))
+    boot_indices = rng.integers(0, n_pairs, size=(num_resamples, n_pairs))
     ci_summary: Dict[str, Any] = {"per_condition": {}, "advantages_vs_complementary": {}}
 
     for c in conds:

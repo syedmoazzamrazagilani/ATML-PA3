@@ -1,3 +1,4 @@
+import math
 from typing import Dict, List, Tuple, Any, Optional
 import torch
 import torch.nn as nn
@@ -9,92 +10,71 @@ from task1.adapters import inject_adapters, LoRALinear
 TASK2_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj")
 
 
-class VisualConnector(nn.Module):
+class VisualConnectorMLP(nn.Module):
     """
-    Two-layer MLP mapping cached SigLIP patch features F(I) in R^{196 x 768}
-    (or R^{49 x 768} when pool_2x2=True) into Qwen's embedding space R^{M x 1024}.
+    Trainable 2-layer MLP connector: Linear(768 -> 1024) -> GELU -> Linear(1024 -> 1024).
+    Kept in FP32 for master parameter precision.
     """
-    def __init__(
-        self,
-        in_dim: int = 768,
-        hidden_dim: int = 1024,
-        out_dim: int = 1024,
-        pool_2x2: bool = False,
-    ):
+    def __init__(self, in_dim: int = 768, hidden_dim: int = 1024, out_dim: int = 1024, seed: int = 6304):
         super().__init__()
-        self.pool_2x2 = pool_2x2
-        self.num_visual_tokens = 49 if pool_2x2 else 196
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed)
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, out_dim)
+        nn.init.kaiming_uniform_(self.fc1.weight, a=math.sqrt(5), generator=gen)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.kaiming_uniform_(self.fc2.weight, a=math.sqrt(5), generator=gen)
+        nn.init.zeros_(self.fc2.bias)
         self.calibration_scale = 1.0
-        self.calibration_rule = (
-            "Rescale fc2.weight and fc2.bias by RMS(E_text_train) / RMS(g_phi(F_train)) "
-            "using training image features and training caption token embeddings only."
-        )
 
-    def forward(self, vis_feats: torch.Tensor) -> torch.Tensor:
-        x = vis_feats.to(torch.float32)
-        if self.pool_2x2 and x.size(1) == 196:
-            B, _, D = x.shape
-            x = (
-                x.view(B, 14, 14, D)
-                .view(B, 7, 2, 7, 2, D)
-                .mean(dim=(2, 4))
-                .reshape(B, 49, D)
-            )
+    def forward(self, visual_feats: torch.Tensor) -> torch.Tensor:
+        x = visual_feats.to(torch.float32)
         return self.fc2(self.act(self.fc1(x)))
 
     @torch.no_grad()
     def calibrate_to_text_embeddings(
-        self, sample_train_vis_feats: torch.Tensor, text_embed_weight: torch.Tensor
+        self,
+        sample_visual_feats: torch.Tensor,
+        text_embed_weight: torch.Tensor,
     ) -> Dict[str, Any]:
-        """Calibrate connector initial output RMS magnitude against Qwen text embeddings using training data only."""
+        """
+        Calibrate connector output RMS magnitude against Qwen text embedding RMS magnitude
+        using training data only, rescaling fc2 weight and bias in-place.
+        """
         device = next(self.parameters()).device
-        vis_out = self.forward(sample_train_vis_feats.to(device))
-        vis_rms = float(torch.sqrt(torch.mean(vis_out.float() ** 2)).item())
-        text_rms = float(
-            torch.sqrt(torch.mean(text_embed_weight.detach().float() ** 2)).item()
-        )
-        scale = text_rms / max(vis_rms, 1e-8)
+        vis_out = self.forward(sample_visual_feats.to(device))
+        vis_rms = float(torch.sqrt(torch.mean(vis_out ** 2)).item())
+        txt_rms = float(torch.sqrt(torch.mean(text_embed_weight.detach().float() ** 2)).item())
+        scale = txt_rms / max(vis_rms, 1e-8)
         self.fc2.weight.data.mul_(scale)
-        if self.fc2.bias is not None:
-            self.fc2.bias.data.mul_(scale)
-        self.calibration_scale = float(scale)
-        post_vis_rms = float(
-            torch.sqrt(
-                torch.mean(self.forward(sample_train_vis_feats.to(device)).float() ** 2)
-            ).item()
-        )
+        self.fc2.bias.data.mul_(scale)
+        self.calibration_scale = scale
+        post_out = self.forward(sample_visual_feats.to(device))
+        post_rms = float(torch.sqrt(torch.mean(post_out ** 2)).item())
         return {
-            "rule": self.calibration_rule,
-            "text_embed_rms": text_rms,
+            "rule": "rms_match_fc2_rescale_on_train_features",
             "pre_calibration_vis_rms": vis_rms,
-            "calibration_scale_factor": self.calibration_scale,
-            "post_calibration_vis_rms": post_vis_rms,
+            "target_text_embed_rms": txt_rms,
+            "calibration_scale_factor": scale,
+            "post_calibration_vis_rms": post_rms,
         }
 
 
 class SiglipQwenVLM(nn.Module):
     """
     SigLIP-Qwen3-0.6B Vision-Language Model.
-    Inserts M in {196, 49} visual tokens at the start of the user message before the question,
-    preserving Qwen's non-thinking chat structure.
+    Inserts continuous visual embeddings Z(I) in R^{N_vis x 1024} into the user message
+    immediately before the question tokens, preserving Qwen's non-thinking chat structure.
     """
     def __init__(
         self,
         qwen_model: nn.Module,
-        tokenizer: Any,
-        pool_2x2: bool = False,
-        init_seed: int = 6304,
+        num_visual_tokens: int = 196,
+        seed: int = 6304,
     ):
         super().__init__()
         self.qwen = qwen_model
-        self.tokenizer = tokenizer
-        self.pool_2x2 = pool_2x2
-        self.init_seed = init_seed
-
-        # Freeze all Qwen backbone parameters in FP16
         for p in self.qwen.parameters():
             p.requires_grad_(False)
 
@@ -110,371 +90,372 @@ class SiglipQwenVLM(nn.Module):
         if hasattr(self.qwen, "enable_input_require_grads"):
             self.qwen.enable_input_require_grads()
 
-        torch.manual_seed(init_seed)
-        device = next(self.qwen.parameters()).device
-        self.connector = VisualConnector(
-            768, 1024, 1024, pool_2x2=pool_2x2
-        ).to(device=device, dtype=torch.float32)
+        d_model = self.qwen.get_input_embeddings().weight.shape[1]
+        self.connector = VisualConnectorMLP(
+            in_dim=768, hidden_dim=d_model, out_dim=d_model, seed=seed
+        ).to(device=next(self.qwen.parameters()).device, dtype=torch.float32)
+
+        self.num_visual_tokens = num_visual_tokens
         self.lora_enabled = False
+        self.calibration_info: Dict[str, Any] = {}
 
-        # Precompute chat template boundary token IDs (with thinking disabled)
-        self.user_prefix_ids = self.tokenizer.encode(
-            "<|im_start|>user\n", add_special_tokens=False
+    def calibrate_connector(self, sample_train_feats: torch.Tensor) -> Dict[str, Any]:
+        txt_w = self.qwen.get_input_embeddings().weight
+        self.calibration_info = self.connector.calibrate_to_text_embeddings(
+            sample_train_feats, txt_w
         )
-        self.assistant_prefix_ids = self.tokenizer.encode(
-            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            add_special_tokens=False,
-        )
-        im_end = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self.im_end_id = (
-            int(im_end)
-            if isinstance(im_end, int) and im_end >= 0
-            else int(self.tokenizer.eos_token_id)
-        )
-        self.pad_token_id = int(
-            self.tokenizer.pad_token_id
-            if self.tokenizer.pad_token_id is not None
-            else self.im_end_id
-        )
+        return self.calibration_info
 
-    def enable_stage2_lora(self) -> Dict[str, float]:
-        """Enable LoRA (r=16, alpha=32, dropout=0.05) on q_proj, k_proj, v_proj, o_proj for Stages 2-3."""
+    def enable_stage2_lora(
+        self, r: int = 16, alpha: float = 32.0, dropout: float = 0.05, init_seed: int = 6304
+    ) -> Dict[str, float]:
+        """Enable LoRA adapters on q_proj, k_proj, v_proj, o_proj for Stages 2 and 3."""
         if self.lora_enabled:
-            return {"trainable_params": self.count_trainable_params()["total"]}
-        meta = inject_adapters(
+            return self.get_parameter_breakdown()
+        inject_adapters(
             self.qwen,
-            r=16,
-            alpha=32.0,
-            dropout=0.05,
+            r=r,
+            alpha=alpha,
+            dropout=dropout,
             use_oplora=False,
             target_modules=TASK2_LORA_TARGETS,
-            init_seed=self.init_seed,
+            init_seed=init_seed,
         )
-        # Ensure connector remains trainable in FP32
+        # Ensure connector remains trainable
         for p in self.connector.parameters():
             p.requires_grad_(True)
         self.lora_enabled = True
-        return meta
+        return self.get_parameter_breakdown()
 
-    def count_trainable_params(self) -> Dict[str, int]:
-        conn_p = sum(p.numel() for p in self.connector.parameters() if p.requires_grad)
-        lora_p = sum(p.numel() for p in self.qwen.parameters() if p.requires_grad)
-        return {"connector": conn_p, "lora": lora_p, "total": conn_p + lora_p}
-
-    def build_tokenized_text_parts(
-        self,
-        question: str,
-        target: Optional[str] = None,
-        is_caption: bool = False,
-    ) -> Dict[str, List[int]]:
-        """
-        Apply Task 2 content-token caps:
-          - Question: 80 tokens
-          - Caption target: 64 tokens
-          - Short-answer target: 16 tokens
-        """
-        q_ids = self.tokenizer.encode(question.strip(), add_special_tokens=False)[:80]
-        after_vis_ids = q_ids + self.assistant_prefix_ids
-
-        target_content_ids: List[int] = []
-        if target is not None:
-            cap = 64 if is_caption else 16
-            target_content_ids = self.tokenizer.encode(
-                target.strip(), add_special_tokens=False
-            )[:cap]
-
+    def get_parameter_breakdown(self) -> Dict[str, int]:
+        conn_params = sum(p.numel() for p in self.connector.parameters() if p.requires_grad)
+        lora_params = sum(p.numel() for p in self.qwen.parameters() if p.requires_grad)
         return {
-            "prefix_ids": list(self.user_prefix_ids),
-            "after_vis_ids": after_vis_ids,
-            "target_content_ids": target_content_ids,
-            "target_with_eot_ids": target_content_ids + [self.im_end_id]
-            if target is not None
-            else [],
+            "connector_trainable_params": conn_params,
+            "lora_trainable_params": lora_params,
+            "total_trainable_params": conn_params + lora_params,
         }
 
-    def prepare_multimodal_batch(
+    def get_trainable_state_dict(self) -> Dict[str, Any]:
+        state = {
+            "connector": {k: v.detach().cpu() for k, v in self.connector.state_dict().items()},
+            "lora_enabled": self.lora_enabled,
+            "lora": {},
+        }
+        if self.lora_enabled:
+            for name, mod in self.qwen.named_modules():
+                if isinstance(mod, LoRALinear):
+                    state["lora"][f"{name}.lora_A"] = mod.lora_A.detach().cpu()
+                    state["lora"][f"{name}.lora_B"] = mod.lora_B.detach().cpu()
+        return state
+
+    def load_trainable_state_dict(self, state: Dict[str, Any]) -> None:
+        self.connector.load_state_dict(state["connector"])
+        if state.get("lora_enabled", False):
+            if not self.lora_enabled:
+                self.enable_stage2_lora()
+            lora_dict = state.get("lora", {})
+            for name, mod in self.qwen.named_modules():
+                if isinstance(mod, LoRALinear) and f"{name}.lora_A" in lora_dict:
+                    mod.lora_A.data.copy_(lora_dict[f"{name}.lora_A"].to(mod.lora_A.device))
+                    mod.lora_B.data.copy_(lora_dict[f"{name}.lora_B"].to(mod.lora_B.device))
+
+    def _tokenize_segments(
+        self,
+        tokenizer: Any,
+        question: str,
+        target_text: Optional[str],
+        is_caption: bool,
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Construct token segments preserving Qwen3's non-thinking chat structure:
+          prefix_ids: `<|im_start|>user\n`
+          middle_ids: `<question_tokens><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n`
+          target_ids: `<target_tokens><|im_end|>`
+        Enforces content-token caps: question=80, caption=64, short-answer=16.
+        """
+        prefix_ids = tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
+        q_ids = tokenizer.encode(question.strip(), add_special_tokens=False)[:80]
+        suffix_prompt_ids = tokenizer.encode(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            add_special_tokens=False,
+        )
+        middle_ids = q_ids + suffix_prompt_ids
+
+        if target_text is None:
+            return prefix_ids, middle_ids, []
+
+        cap_limit = 64 if is_caption else 16
+        t_ids = tokenizer.encode(target_text.strip(), add_special_tokens=False)[:cap_limit]
+        im_end_id = getattr(tokenizer, "eos_token_id", 151645)
+        if hasattr(tokenizer, "convert_tokens_to_ids"):
+            try:
+                cand = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                if isinstance(cand, int) and cand >= 0:
+                    im_end_id = cand
+            except Exception:
+                pass
+        target_ids = t_ids + [im_end_id]
+        return prefix_ids, middle_ids, target_ids
+
+    def _build_multimodal_batch(
         self,
         batch_items: List[Dict[str, Any]],
-        vis_feats_batch: Optional[torch.Tensor],
-        has_image: bool = True,
-        exclude_eot_from_labels: bool = False,
+        tokenizer: Any,
+        feature_store: Any,
+        condition: str = "correct",
+        for_generation: bool = False,
+        include_eot_in_labels: bool = True,
     ) -> Dict[str, Any]:
         """
-        Splice continuous visual embeddings into the user message before the question:
-          [Embed(<|im_start|>user\n), Z(I), Embed(question + assistant_prefix), Embed(target + <|im_end|>)]
-        Constructs matching labels (-100 on visual tokens, prompts, and padding),
-        attention_mask, position_ids, and per-example valid token counts |R_i|.
-        If has_image=False (No-image condition), omits visual tokens and rebuilds masks and positions.
+        Splice continuous visual embeddings into the user turn before the question tokens:
+          [prefix_embeds ("<|im_start|>user\n"), visual_embeds (N_vis), middle_embeds (question + assistant header), target_embeds]
+        For `condition == "no_image"`, omits visual tokens and rebuilds attention_mask, labels, and position_ids.
+        Uses left-padding for generation batches and right-padding for teacher-forced training/NLL batches.
         """
         device = next(self.qwen.parameters()).device
-        embed_layer = self.qwen.model.embed_tokens
+        embed_layer = self.qwen.get_input_embeddings()
         embed_dtype = embed_layer.weight.dtype
 
-        if has_image and vis_feats_batch is not None:
-            vis_embeds = self.connector(vis_feats_batch.to(device)).to(embed_dtype)
-            num_vis = vis_embeds.size(1)
+        use_visual = condition != "no_image"
+        if use_visual:
+            img_ids = []
+            for item in batch_items:
+                if condition == "correct":
+                    img_ids.append(item["image_id"])
+                elif condition == "complementary":
+                    img_ids.append(item["partner_image_id"])
+                elif condition == "mismatched":
+                    img_ids.append(item["mismatched_image_id"])
+                else:
+                    img_ids.append(item["image_id"])
+            raw_vis_feats = feature_store.get_batch_features(img_ids, device=device)
+            vis_embeds_batch = self.connector(raw_vis_feats).to(dtype=embed_dtype)
+            n_vis = vis_embeds_batch.size(1)
         else:
-            vis_embeds = None
-            num_vis = 0
+            vis_embeds_batch = None
+            n_vis = 0
 
         seq_embeds_list = []
-        labels_list = []
-        valid_counts = []
-
+        seq_labels_list = []
         for idx, item in enumerate(batch_items):
-            parts = self.build_tokenized_text_parts(
-                question=item["question"],
-                target=item.get("target"),
-                is_caption=item.get("is_caption", False),
+            prefix_ids, middle_ids, target_ids = self._tokenize_segments(
+                tokenizer,
+                item["question"],
+                None if for_generation else item["target_text"],
+                item.get("is_caption", False),
             )
-            p_ids = torch.tensor(parts["prefix_ids"], dtype=torch.long, device=device)
-            av_ids = torch.tensor(parts["after_vis_ids"], dtype=torch.long, device=device)
+            p_emb = embed_layer(torch.tensor(prefix_ids, dtype=torch.long, device=device))
+            m_emb = embed_layer(torch.tensor(middle_ids, dtype=torch.long, device=device))
 
-            t_full_ids = parts["target_with_eot_ids"]
-            t_tensor = torch.tensor(t_full_ids, dtype=torch.long, device=device)
+            parts = [p_emb]
+            if use_visual and vis_embeds_batch is not None:
+                parts.append(vis_embeds_batch[idx])
+            parts.append(m_emb)
 
-            p_emb = embed_layer(p_ids)
-            av_emb = embed_layer(av_ids)
-            t_emb = embed_layer(t_tensor) if len(t_full_ids) > 0 else p_emb[:0]
+            prompt_total_len = len(prefix_ids) + n_vis + len(middle_ids)
+            if not for_generation:
+                t_emb = embed_layer(torch.tensor(target_ids, dtype=torch.long, device=device))
+                parts.append(t_emb)
+                labels_i = [-100] * prompt_total_len + list(target_ids)
+                if not include_eot_in_labels and len(labels_i) > prompt_total_len:
+                    # Mask termination token (<|im_end|>) for answer NLL evaluation
+                    labels_i[-1] = -100
+                seq_labels_list.append(labels_i)
 
-            if has_image and vis_embeds is not None:
-                v_emb = vis_embeds[idx]
-                full_emb = torch.cat([p_emb, v_emb, av_emb, t_emb], dim=0)
-                prompt_len = p_ids.numel() + num_vis + av_ids.numel()
-            else:
-                full_emb = torch.cat([p_emb, av_emb, t_emb], dim=0)
-                prompt_len = p_ids.numel() + av_ids.numel()
+            seq_embeds_list.append(torch.cat(parts, dim=0))
 
-            if exclude_eot_from_labels and len(t_full_ids) > 0:
-                # For reference-answer NLL, exclude termination token (<|im_end|>)
-                sup_ids = parts["target_content_ids"] + [-100]
-            else:
-                sup_ids = list(t_full_ids)
+        max_len = max(x.size(0) for x in seq_embeds_list)
+        d_model = seq_embeds_list[0].size(1)
+        B = len(seq_embeds_list)
 
-            lbl = [-100] * prompt_len + sup_ids
-            r_i = sum(1 for x in sup_ids if x != -100)
-            seq_embeds_list.append(full_emb)
-            labels_list.append(torch.tensor(lbl, dtype=torch.long, device=device))
-            valid_counts.append(max(1, r_i))
-
-        max_len = max(e.size(0) for e in seq_embeds_list)
-        pad_emb = embed_layer(
-            torch.tensor([self.pad_token_id], dtype=torch.long, device=device)
+        padded_embeds = torch.zeros((B, max_len, d_model), dtype=embed_dtype, device=device)
+        attention_mask = torch.zeros((B, max_len), dtype=torch.long, device=device)
+        position_ids = torch.zeros((B, max_len), dtype=torch.long, device=device)
+        padded_labels = (
+            torch.full((B, max_len), -100, dtype=torch.long, device=device)
+            if not for_generation
+            else None
         )
 
-        padded_embeds = []
-        padded_labels = []
-        attn_masks = []
-        pos_ids = []
-
-        for emb, lbl in zip(seq_embeds_list, labels_list):
-            cur_len = emb.size(0)
-            pad_len = max_len - cur_len
-            if pad_len > 0:
-                padded_embeds.append(
-                    torch.cat([emb, pad_emb.expand(pad_len, -1)], dim=0)
-                )
-                padded_labels.append(
-                    torch.cat(
-                        [
-                            lbl,
-                            torch.full(
-                                (pad_len,), -100, dtype=torch.long, device=device
-                            ),
-                        ],
-                        dim=0,
-                    )
-                )
-                attn_masks.append(
-                    torch.cat(
-                        [
-                            torch.ones(cur_len, dtype=torch.long, device=device),
-                            torch.zeros(pad_len, dtype=torch.long, device=device),
-                        ],
-                        dim=0,
-                    )
-                )
+        for i, emb in enumerate(seq_embeds_list):
+            L = emb.size(0)
+            if for_generation:
+                # Left-pad for batched autoregressive generation
+                pad_len = max_len - L
+                padded_embeds[i, pad_len:, :] = emb
+                attention_mask[i, pad_len:] = 1
+                position_ids[i, pad_len:] = torch.arange(L, dtype=torch.long, device=device)
             else:
-                padded_embeds.append(emb)
-                padded_labels.append(lbl)
-                attn_masks.append(torch.ones(cur_len, dtype=torch.long, device=device))
-            pos_ids.append(torch.arange(max_len, dtype=torch.long, device=device))
+                padded_embeds[i, :L, :] = emb
+                attention_mask[i, :L] = 1
+                position_ids[i, :L] = torch.arange(L, dtype=torch.long, device=device)
+                padded_labels[i, :L] = torch.tensor(seq_labels_list[i], dtype=torch.long, device=device)
 
         return {
-            "inputs_embeds": torch.stack(padded_embeds, dim=0),
-            "labels": torch.stack(padded_labels, dim=0),
-            "attention_mask": torch.stack(attn_masks, dim=0),
-            "position_ids": torch.stack(pos_ids, dim=0),
-            "valid_counts": torch.tensor(valid_counts, dtype=torch.float32, device=device),
+            "inputs_embeds": padded_embeds,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "labels": padded_labels,
         }
 
-    def compute_per_example_losses(
+    def forward_example_weighted_loss_sum(
         self,
         batch_items: List[Dict[str, Any]],
-        vis_feats_batch: Optional[torch.Tensor],
-        has_image: bool = True,
-        exclude_eot_from_labels: bool = False,
+        tokenizer: Any,
+        feature_store: Any,
     ) -> torch.Tensor:
         """
-        Compute per-example token-averaged negative log-likelihood:
-            l_i = - (1 / |R_i|) * sum_{t in R_i} log p(y_{i,t} | I_i, q_i, y_{i,<t})
-        Returns tensor of shape (B,) in FP32.
+        Compute sum of per-example mean supervised-token losses across the microbatch:
+            sum_{i in MB} (1 / |R_i|) sum_{t in R_i} -log p(y_{i,t} | I_i, q_i, y_{i,<t})
+        Projects only valid supervised positions through `lm_head` to avoid full-vocabulary VRAM spikes.
         """
-        prepared = self.prepare_multimodal_batch(
-            batch_items,
-            vis_feats_batch,
-            has_image=has_image,
-            exclude_eot_from_labels=exclude_eot_from_labels,
+        batch = self._build_multimodal_batch(
+            batch_items, tokenizer, feature_store, condition="correct", for_generation=False, include_eot_in_labels=True
         )
-        inputs_embeds = prepared["inputs_embeds"]
-        labels = prepared["labels"]
-        attention_mask = prepared["attention_mask"]
-        position_ids = prepared["position_ids"]
-        valid_counts = prepared["valid_counts"]
-
         backbone_out = self.qwen.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+            inputs_embeds=batch["inputs_embeds"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
             use_cache=False,
         )
-        hidden_states = (
+        hidden = (
             backbone_out.last_hidden_state
             if hasattr(backbone_out, "last_hidden_state")
             else backbone_out[0]
         )
-
-        shift_h = hidden_states[..., :-1, :]
-        shift_labels = labels[..., 1:]
-        B, S_minus_1, _ = shift_h.shape
-
+        shift_h = hidden[:, :-1, :]
+        shift_labels = batch["labels"][:, 1:]
         valid_mask = shift_labels != -100
-        if not valid_mask.any():
-            return hidden_states.sum() * 0.0
 
         valid_h = shift_h[valid_mask]
         valid_targets = shift_labels[valid_mask]
-        batch_indices = (
-            torch.arange(B, device=hidden_states.device)
-            .unsqueeze(1)
-            .expand(B, S_minus_1)[valid_mask]
-        )
+        if valid_targets.numel() == 0:
+            return hidden.sum() * 0.0
+
+        # Compute token weights 1 / |R_i| for each valid token so summing equals sum_i (1/|R_i|) sum_t CE_{i,t}
+        per_ex_counts = valid_mask.sum(dim=1).clamp(min=1).to(torch.float32)
+        ex_weights = (1.0 / per_ex_counts).unsqueeze(1).expand_as(shift_labels)
+        valid_weights = ex_weights[valid_mask]
 
         lm_head = self.qwen.lm_head
         logits_valid = F.linear(valid_h, lm_head.weight, lm_head.bias).float()
-        token_losses = F.cross_entropy(logits_valid, valid_targets, reduction="none")
-
-        per_ex_sum = torch.zeros(B, device=hidden_states.device, dtype=torch.float32)
-        per_ex_sum.index_add_(0, batch_indices, token_losses)
-        return per_ex_sum / valid_counts
+        token_ces = F.cross_entropy(logits_valid, valid_targets, reduction="none")
+        return torch.sum(token_ces * valid_weights)
 
     @torch.no_grad()
-    def greedy_generate_batch(
+    def compute_per_example_nll(
         self,
-        questions: List[str],
-        vis_feats_batch: Optional[torch.Tensor],
-        has_image: bool = True,
+        batch_items: List[Dict[str, Any]],
+        tokenizer: Any,
+        feature_store: Any,
+        include_eot: bool = False,
+        condition: str = "correct",
+    ) -> List[float]:
+        """
+        Compute per-example token-averaged negative log-likelihood (NLL).
+        For answer NLL (`include_eot=False`), excludes termination token (<|im_end|>).
+        """
+        batch = self._build_multimodal_batch(
+            batch_items,
+            tokenizer,
+            feature_store,
+            condition=condition,
+            for_generation=False,
+            include_eot_in_labels=include_eot,
+        )
+        backbone_out = self.qwen.model(
+            inputs_embeds=batch["inputs_embeds"],
+            attention_mask=batch["attention_mask"],
+            position_ids=batch["position_ids"],
+            use_cache=False,
+        )
+        hidden = (
+            backbone_out.last_hidden_state
+            if hasattr(backbone_out, "last_hidden_state")
+            else backbone_out[0]
+        )
+        shift_h = hidden[:, :-1, :]
+        shift_labels = batch["labels"][:, 1:]
+        lm_head = self.qwen.lm_head
+
+        nlls = []
+        for i in range(len(batch_items)):
+            mask_i = shift_labels[i] != -100
+            if not torch.any(mask_i):
+                nlls.append(0.0)
+                continue
+            h_i = shift_h[i][mask_i]
+            t_i = shift_labels[i][mask_i]
+            logits_i = F.linear(h_i, lm_head.weight, lm_head.bias).float()
+            nll_i = F.cross_entropy(logits_i, t_i, reduction="mean")
+            nlls.append(float(nll_i.item()))
+        return nlls
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        batch_items: List[Dict[str, Any]],
+        tokenizer: Any,
+        feature_store: Any,
+        condition: str = "correct",
         max_new_tokens: int = 16,
     ) -> List[str]:
-        """
-        Greedy decoding with thinking disabled and a 16-new-token cap across a batch of prompts.
-        Left-pads prompt embeddings so generation aligns cleanly at the right edge.
-        """
-        self.eval()
-        device = next(self.qwen.parameters()).device
-        embed_layer = self.qwen.model.embed_tokens
-        embed_dtype = embed_layer.weight.dtype
-
-        if has_image and vis_feats_batch is not None:
-            vis_embeds = self.connector(vis_feats_batch.to(device)).to(embed_dtype)
-        else:
-            vis_embeds = None
-
-        prompt_embeds_list = []
-        for idx, q in enumerate(questions):
-            parts = self.build_tokenized_text_parts(q, target=None, is_caption=False)
-            p_emb = embed_layer(
-                torch.tensor(parts["prefix_ids"], dtype=torch.long, device=device)
-            )
-            av_emb = embed_layer(
-                torch.tensor(parts["after_vis_ids"], dtype=torch.long, device=device)
-            )
-            if has_image and vis_embeds is not None:
-                full_p = torch.cat([p_emb, vis_embeds[idx], av_emb], dim=0)
-            else:
-                full_p = torch.cat([p_emb, av_emb], dim=0)
-            prompt_embeds_list.append(full_p)
-
-        B = len(prompt_embeds_list)
-        max_p_len = max(e.size(0) for e in prompt_embeds_list)
-        pad_emb = embed_layer(
-            torch.tensor([self.pad_token_id], dtype=torch.long, device=device)
+        """Greedy batched generation with KV-cache and thinking disabled."""
+        batch = self._build_multimodal_batch(
+            batch_items, tokenizer, feature_store, condition=condition, for_generation=True
         )
+        inputs_embeds = batch["inputs_embeds"]
+        attention_mask = batch["attention_mask"]
+        position_ids = batch["position_ids"]
+        B = inputs_embeds.size(0)
+        device = inputs_embeds.device
 
-        # Left-pad prompts for batched autoregressive greedy decoding
-        cur_embeds = []
-        attn_mask = []
-        for emb in prompt_embeds_list:
-            pad_len = max_p_len - emb.size(0)
-            if pad_len > 0:
-                cur_embeds.append(torch.cat([pad_emb.expand(pad_len, -1), emb], dim=0))
-                attn_mask.append(
-                    torch.cat(
-                        [
-                            torch.zeros(pad_len, dtype=torch.long, device=device),
-                            torch.ones(emb.size(0), dtype=torch.long, device=device),
-                        ],
-                        dim=0,
-                    )
-                )
-            else:
-                cur_embeds.append(emb)
-                attn_mask.append(torch.ones(emb.size(0), dtype=torch.long, device=device))
+        im_end_id = getattr(tokenizer, "eos_token_id", 151645)
+        if hasattr(tokenizer, "convert_tokens_to_ids"):
+            try:
+                cand = tokenizer.convert_tokens_to_ids("<|im_end|>")
+                if isinstance(cand, int) and cand >= 0:
+                    im_end_id = cand
+            except Exception:
+                pass
 
-        inputs_embeds = torch.stack(cur_embeds, dim=0)
-        attention_mask = torch.stack(attn_mask, dim=0)
-        finished = torch.zeros(B, dtype=torch.bool, device=device)
+        embed_layer = self.qwen.get_input_embeddings()
         generated_tokens: List[List[int]] = [[] for _ in range(B)]
+        finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+        past_key_values = None
+        cur_embeds = inputs_embeds
+        cur_mask = attention_mask
+        cur_pos = position_ids
 
         for _ in range(max_new_tokens):
-            pos_ids = attention_mask.long().cumsum(-1) - 1
-            pos_ids.masked_fill_(attention_mask == 0, 0)
-            out = self.qwen.model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=pos_ids,
-                use_cache=False,
+            outputs = self.qwen(
+                inputs_embeds=cur_embeds,
+                attention_mask=cur_mask,
+                position_ids=cur_pos,
+                past_key_values=past_key_values,
+                use_cache=True,
             )
-            last_h = (
-                out.last_hidden_state[:, -1, :]
-                if hasattr(out, "last_hidden_state")
-                else out[0][:, -1, :]
-            )
-            logits = self.qwen.lm_head(last_h)
-            next_ids = torch.argmax(logits, dim=-1)
+            next_token_logits = outputs.logits[:, -1, :]
+            next_tokens = torch.argmax(next_token_logits, dim=-1)
+            past_key_values = outputs.past_key_values
 
             for b_idx in range(B):
                 if not finished[b_idx]:
-                    tok_id = int(next_ids[b_idx].item())
-                    if tok_id in (self.im_end_id, self.tokenizer.eos_token_id):
+                    tok_id = int(next_tokens[b_idx].item())
+                    if tok_id in (im_end_id, tokenizer.eos_token_id):
                         finished[b_idx] = True
                     else:
                         generated_tokens[b_idx].append(tok_id)
 
-            if finished.all():
+            if torch.all(finished):
                 break
 
-            next_emb = embed_layer(next_ids).unsqueeze(1)
-            inputs_embeds = torch.cat([inputs_embeds, next_emb], dim=1)
-            attention_mask = torch.cat(
-                [
-                    attention_mask,
-                    torch.ones((B, 1), dtype=torch.long, device=device),
-                ],
-                dim=1,
+            cur_embeds = embed_layer(next_tokens.unsqueeze(1))
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones((B, 1), dtype=torch.long, device=device)], dim=1
             )
+            cur_pos = cur_pos[:, -1:] + 1
 
-        return [
-            self.tokenizer.decode(toks, skip_special_tokens=True).strip()
-            for toks in generated_tokens
-        ]
+        return [tokenizer.decode(toks, skip_special_tokens=True).strip() for toks in generated_tokens]

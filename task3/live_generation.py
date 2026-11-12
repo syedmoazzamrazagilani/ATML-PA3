@@ -496,7 +496,7 @@ def generate_synthetic_dataset_records(
 
         offsets, k_flat, v_flat = _pack_token_streams(k_tokens_list, v_tokens_list)
         orders = np.stack(
-            [rng.permutation(num_rollouts).astype(np.int32) for _ in range(self.cfg.num_orders)],
+            [rng.permutation(num_rollouts).astype(np.int32) for _ in range(cfg.num_orders)],
             axis=0,
         )
 

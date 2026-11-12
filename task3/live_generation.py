@@ -54,13 +54,14 @@ def _unpack_token_streams(
     num_rollouts: int,
 ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     """Extracts per-rollout token arrays from either CSR-packed or list format."""
-    if "offsets" in rec and isinstance(rec.get("k_tokens"), np.ndarray):
+    if "offsets" in rec:
         offsets = rec["offsets"]
-        k_flat = rec["k_tokens"]
-        v_flat = rec["v_tokens"]
-        k_list = [k_flat[offsets[r] : offsets[r + 1]].copy() for r in range(num_rollouts)]
-        v_list = [v_flat[offsets[r] : offsets[r + 1]].copy() for r in range(num_rollouts)]
-        return k_list, v_list
+        k_flat = rec.get("kl_flat", rec.get("k_tokens"))
+        v_flat = rec.get("vis_flat", rec.get("v_tokens"))
+        if isinstance(k_flat, np.ndarray) and isinstance(v_flat, np.ndarray):
+            k_list = [k_flat[offsets[r] : offsets[r + 1]].copy() for r in range(num_rollouts)]
+            v_list = [v_flat[offsets[r] : offsets[r + 1]].copy() for r in range(num_rollouts)]
+            return k_list, v_list
 
     k_raw = rec.get("k_tokens", [])
     v_raw = rec.get("v_tokens", [])
@@ -80,12 +81,20 @@ def _ensure_csr_record_format(
     records: Dict[str, Dict[str, Any]],
     num_rollouts: int,
 ) -> Dict[str, Dict[str, Any]]:
-    """Ensures every question record has CSR `offsets` and flat 1D token arrays."""
+    """Ensures every question record has CSR `offsets`, `kl_flat`, and `vis_flat` arrays."""
     for rec in records.values():
-        if "offsets" not in rec or not isinstance(rec.get("k_tokens"), np.ndarray):
+        if (
+            "offsets" not in rec
+            or "kl_flat" not in rec
+            or "vis_flat" not in rec
+            or not isinstance(rec.get("kl_flat"), np.ndarray)
+            or not isinstance(rec.get("vis_flat"), np.ndarray)
+        ):
             k_list, v_list = _unpack_token_streams(rec, num_rollouts)
             offsets, k_flat, v_flat = _pack_token_streams(k_list, v_list)
             rec["offsets"] = offsets
+            rec["kl_flat"] = k_flat
+            rec["vis_flat"] = v_flat
             rec["k_tokens"] = k_flat
             rec["v_tokens"] = v_flat
     return records
@@ -386,6 +395,8 @@ class LiveRolloutGenerator:
             "cov_kv": cov_kv_arr,
             "corr_kv": corr_kv_arr,
             "offsets": offsets,
+            "kl_flat": k_flat,
+            "vis_flat": v_flat,
             "k_tokens": k_flat,
             "v_tokens": v_flat,
             "orders": orders,
@@ -515,6 +526,8 @@ def generate_synthetic_dataset_records(
             "cov_kv": cov_kv_arr,
             "corr_kv": corr_kv_arr,
             "offsets": offsets,
+            "kl_flat": k_flat,
+            "vis_flat": v_flat,
             "k_tokens": k_flat,
             "v_tokens": v_flat,
             "orders": orders,
@@ -660,7 +673,10 @@ def run_step4_visual_perturbation(
                 "V": V_c,
                 "KV": K_c * V_c + rec["cov_kv"] * p["v_scale"],
                 "cov_kv": rec["cov_kv"] * p["v_scale"],
+                "lengths": rec["lengths"],
                 "offsets": off_c,
+                "kl_flat": k_flat_c,
+                "vis_flat": v_flat_c,
                 "k_tokens": k_flat_c,
                 "v_tokens": v_flat_c,
             }
@@ -696,7 +712,10 @@ def run_step4_visual_perturbation(
             "V": mix_V,
             "KV": mix_K * mix_V + mix_cov,
             "cov_kv": mix_cov,
+            "lengths": rec["lengths"],
             "offsets": off_m,
+            "kl_flat": k_flat_m,
+            "vis_flat": v_flat_m,
             "k_tokens": k_flat_m,
             "v_tokens": v_flat_m,
         }

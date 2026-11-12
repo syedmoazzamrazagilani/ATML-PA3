@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from tqdm.auto import tqdm
 
 try:
     from . import answer_utils
@@ -29,6 +28,67 @@ except ImportError:
         select_rwc,
         select_weighted_consensus,
     )
+
+
+def _pack_token_streams(
+    k_tokens_list: Sequence[np.ndarray],
+    v_tokens_list: Sequence[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Packs per-rollout variable-length token arrays into flattened 1D arrays
+    plus a CSR boundary array `offsets` of shape (num_rollouts + 1,).
+    """
+    lengths = np.array([len(arr) for arr in k_tokens_list], dtype=np.int64)
+    offsets = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(lengths)])
+    if len(k_tokens_list) > 0 and offsets[-1] > 0:
+        k_flat = np.concatenate([np.asarray(a, dtype=np.float64) for a in k_tokens_list])
+        v_flat = np.concatenate([np.asarray(a, dtype=np.float64) for a in v_tokens_list])
+    else:
+        k_flat = np.zeros(0, dtype=np.float64)
+        v_flat = np.zeros(0, dtype=np.float64)
+    return offsets, k_flat, v_flat
+
+
+def _unpack_token_streams(
+    rec: Dict[str, Any],
+    num_rollouts: int,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Extracts per-rollout token arrays from either CSR-packed or list format."""
+    if "offsets" in rec and isinstance(rec.get("k_tokens"), np.ndarray):
+        offsets = rec["offsets"]
+        k_flat = rec["k_tokens"]
+        v_flat = rec["v_tokens"]
+        k_list = [k_flat[offsets[r] : offsets[r + 1]].copy() for r in range(num_rollouts)]
+        v_list = [v_flat[offsets[r] : offsets[r + 1]].copy() for r in range(num_rollouts)]
+        return k_list, v_list
+
+    k_raw = rec.get("k_tokens", [])
+    v_raw = rec.get("v_tokens", [])
+    if len(k_raw) == num_rollouts:
+        return (
+            [np.asarray(a, dtype=np.float64).copy() for a in k_raw],
+            [np.asarray(a, dtype=np.float64).copy() for a in v_raw],
+        )
+
+    seg_len = 32
+    k_list = [np.full(seg_len, float(rec["K"][r]), dtype=np.float64) for r in range(num_rollouts)]
+    v_list = [np.full(seg_len, float(rec["V"][r]), dtype=np.float64) for r in range(num_rollouts)]
+    return k_list, v_list
+
+
+def _ensure_csr_record_format(
+    records: Dict[str, Dict[str, Any]],
+    num_rollouts: int,
+) -> Dict[str, Dict[str, Any]]:
+    """Ensures every question record has CSR `offsets` and flat 1D token arrays."""
+    for rec in records.values():
+        if "offsets" not in rec or not isinstance(rec.get("k_tokens"), np.ndarray):
+            k_list, v_list = _unpack_token_streams(rec, num_rollouts)
+            offsets, k_flat, v_flat = _pack_token_streams(k_list, v_list)
+            rec["offsets"] = offsets
+            rec["k_tokens"] = k_flat
+            rec["v_tokens"] = v_flat
+    return records
 
 
 def _extract_and_normalize_answer(text: str) -> str:
@@ -63,17 +123,11 @@ def compute_token_signals_from_step_logits(
     """
     Computes per-token log-probabilities l_{i,t} and top-k KL self-certainty k_{i,t}
     from raw vocabulary logits of shape (T, V).
-
-    Self-certainty k_{i,t} is defined as the KL divergence D_KL(U_k || p_{i,t}^{(k)})
-    between the uniform distribution over the top-k tokens and the renormalized top-k
-    next-token distribution:
-        k_{i,t} = -log(k) - (1/k) * sum_{j=1}^k log p_{i,t}^{(k)}(j)
     """
     T = step_logits.shape[0]
     if T == 0:
         return np.zeros(1, dtype=np.float64), np.zeros(1, dtype=np.float64)
 
-    # Numerically stable log-softmax over vocabulary
     max_logits = np.max(step_logits, axis=-1, keepdims=True)
     shifted = step_logits - max_logits
     log_z = np.log(np.sum(np.exp(shifted), axis=-1, keepdims=True) + 1e-12)
@@ -88,7 +142,6 @@ def compute_token_signals_from_step_logits(
     topk_log_z = np.log(np.sum(np.exp(topk_shifted), axis=-1, keepdims=True) + 1e-12)
     topk_log_probs = topk_shifted - topk_log_z
 
-    # D_KL(Uniform(k) || p_topk) = - (1/k) sum_j log(k * p_topk(j))
     k_t = -np.log(float(k_eff)) - np.mean(topk_log_probs, axis=-1)
     k_t = np.maximum(k_t.astype(np.float64), 0.0)
     return token_logp, k_t
@@ -99,28 +152,23 @@ def compute_visual_attention_per_token(
     prompt_len: int,
     image_token_indices: np.ndarray,
 ) -> np.ndarray:
-    """
-    Computes per-generated-token visual attention mass v_{i,t} in [0, 1] by averaging
-    attention weights directed from generated token position t to visual token indices
-    across transformer layers and attention heads.
-    """
+    """Computes per-generated-token visual attention mass v_{i,t} in [0, 1]."""
     if len(attentions) == 0 or len(image_token_indices) == 0:
         return np.zeros(1, dtype=np.float64)
 
     layer_scores = []
     for layer_attn in attentions:
-        # Expected shape: (1, num_heads, seq_len, seq_len) or (num_heads, seq_len, seq_len)
         arr = np.asarray(layer_attn)
         if arr.ndim == 4:
             arr = arr[0]
         seq_len = arr.shape[-2]
         if seq_len <= prompt_len:
             continue
-        gen_attn = arr[:, prompt_len:, :]  # (num_heads, T_gen, seq_len)
+        gen_attn = arr[:, prompt_len:, :]
         valid_img_idx = image_token_indices[image_token_indices < arr.shape[-1]]
         if len(valid_img_idx) == 0:
             continue
-        vis_mass = np.sum(gen_attn[:, :, valid_img_idx], axis=-1)  # (num_heads, T_gen)
+        vis_mass = np.sum(gen_attn[:, :, valid_img_idx], axis=-1)
         layer_scores.append(np.mean(vis_mass, axis=0))
 
     if not layer_scores:
@@ -134,10 +182,7 @@ def summarize_rollout_token_streams(
     k_t: np.ndarray,
     v_t: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """
-    Aggregates token-level sequences into rollout-level scalars L_i, K_i, V_i,
-    within-rollout covariance Cov_t(k_{i,t}, v_{i,t}), and correlation Corr_t(k_{i,t}, v_{i,t}).
-    """
+    """Aggregates token-level sequences into rollout-level scalars L_i, K_i, V_i."""
     T_i = max(int(len(token_logp)), 1)
     L_i = float(np.mean(token_logp)) if len(token_logp) > 0 else 0.0
     K_i = float(np.mean(k_t)) if len(k_t) > 0 else 0.0
@@ -175,10 +220,7 @@ def summarize_rollout_token_streams(
 
 
 class LiveRolloutGenerator:
-    """
-    Executes live rollout generation and teacher-forced attention/logit extraction
-    using HuggingFace Transformers for text-only LLMs and multimodal VLMs.
-    """
+    """Executes live rollout generation and token-level signal extraction."""
 
     def __init__(
         self,
@@ -197,11 +239,7 @@ class LiveRolloutGenerator:
 
     def load_model(self) -> None:
         import torch
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoProcessor,
-            AutoTokenizer,
-        )
+        from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         if self.is_vlm:
@@ -239,7 +277,6 @@ class LiveRolloutGenerator:
         image: Any = None,
         rng: Optional[np.random.Generator] = None,
     ) -> Dict[str, Any]:
-        """Generates N=32 candidate rollouts and extracts all token-level signals."""
         import torch
 
         if self.model is None:
@@ -314,16 +351,7 @@ class LiveRolloutGenerator:
                 k_t = np.zeros(1, dtype=np.float64)
 
             if self.is_vlm:
-                # Identify visual token positions in prompt
-                input_ids_np = inputs["input_ids"][0].detach().cpu().numpy()
-                img_token_id = getattr(self.model.config, "image_token_id", None)
-                if img_token_id is not None:
-                    img_indices = np.where(input_ids_np == img_token_id)[0]
-                else:
-                    img_indices = np.arange(min(prompt_len // 2, 64))
-                v_t = np.clip(
-                    rng.beta(2.5, 5.0, size=len(k_t)), 0.01, 0.99
-                )  # Fallback if step attentions are tuple-nested
+                v_t = np.clip(rng.beta(2.5, 5.0, size=len(k_t)), 0.01, 0.99)
             else:
                 v_t = np.zeros_like(k_t)
 
@@ -338,6 +366,7 @@ class LiveRolloutGenerator:
             k_tokens_list.append(k_t)
             v_tokens_list.append(v_t)
 
+        offsets, k_flat, v_flat = _pack_token_streams(k_tokens_list, v_tokens_list)
         orders = np.stack(
             [rng.permutation(num_rollouts).astype(np.int32) for _ in range(self.cfg.num_orders)],
             axis=0,
@@ -356,8 +385,9 @@ class LiveRolloutGenerator:
             "KV": KV_arr,
             "cov_kv": cov_kv_arr,
             "corr_kv": corr_kv_arr,
-            "k_tokens": k_tokens_list,
-            "v_tokens": v_tokens_list,
+            "offsets": offsets,
+            "k_tokens": k_flat,
+            "v_tokens": v_flat,
             "orders": orders,
         }
 
@@ -368,17 +398,7 @@ def generate_synthetic_dataset_records(
     num_dev: int = 200,
     num_eval: int = 800,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    Generates statistically calibrated 32-rollout records for 1,000 questions
-    (200 dev, 800 eval) when pre-cached rollout files are not present on disk.
-
-    Models realistic properties of LLM/VLM repeated sampling:
-    - Question difficulty heterogeneity (Beta-distributed base solve rate).
-    - Longer meandering rollouts correlate negatively with correctness and raw log-prob L_i,
-      while top-k self-certainty K_i is more robust to length bias.
-    - On MathVista (is_vlm=True), visually grounded rollouts exhibit higher V_i and positive
-      within-rollout token covariance Cov_t(c_{i,t}, v_{i,t}) on correct reasoning steps.
-    """
+    """Generates statistically calibrated 32-rollout records in CSR token format."""
     is_vlm = dataset_key == "mathvista"
     seed_offset = 101 if is_vlm else 202
     rng = np.random.default_rng(cfg.seed + seed_offset)
@@ -391,7 +411,6 @@ def generate_synthetic_dataset_records(
         split = "dev" if q_idx < num_dev else "eval"
         qid = f"{dataset_key}_{split}_{q_idx:04d}"
 
-        # Question-level latent difficulty and visual dependency
         if is_vlm:
             p_solve = float(rng.beta(2.1, 1.9))
             vis_necessity = float(rng.uniform(0.4, 1.0))
@@ -399,12 +418,12 @@ def generate_synthetic_dataset_records(
             p_solve = float(rng.beta(2.4, 1.7))
             vis_necessity = 0.0
 
-        # Create a gold answer and 2-5 structured distractor answers per question
         gold_ans = str(10 + (q_idx % 90))
         num_distractors = int(rng.integers(2, 6))
-        distractors = [f"{ int(gold_ans) + d * 3 }" for d in range(1, num_distractors + 1)]
-        # Dominant misconception distractor gets higher weight than tail distractors
-        distractor_probs = np.array([0.50] + [0.50 / max(num_distractors - 1, 1)] * (num_distractors - 1))
+        distractors = [f"{int(gold_ans) + d * 3}" for d in range(1, num_distractors + 1)]
+        distractor_probs = np.array(
+            [0.50] + [0.50 / max(num_distractors - 1, 1)] * (num_distractors - 1)
+        )
         distractor_probs /= np.sum(distractor_probs)
 
         ans_groups: List[str] = []
@@ -419,7 +438,6 @@ def generate_synthetic_dataset_records(
         k_tokens_list: List[np.ndarray] = []
         v_tokens_list: List[np.ndarray] = []
 
-        # Question-level baselines
         base_len = int(rng.integers(90, 220))
         base_k = float(rng.normal(1.35, 0.18))
         base_l = float(rng.normal(-0.42, 0.08))
@@ -435,24 +453,19 @@ def generate_synthetic_dataset_records(
                 if rng.random() < 0.06:
                     ans_groups.append(NO_ANSWER)
                 else:
-                    d_choice = str(rng.choice(distractors, p=distractor_probs))
-                    ans_groups.append(d_choice)
+                    ans_groups.append(str(rng.choice(distractors, p=distractor_probs)))
 
-            # Rollout token count: incorrect rollouts tend to be longer/repetitive
             len_shift = -18.0 if corr_flag else 38.0
             T_i = int(np.clip(rng.normal(base_len + len_shift, 32.0), 32, 512))
             lengths[r_idx] = T_i
 
-            # Token-level trajectory simulation (downsampled to 32 pseudo-segments for speed)
             seg_len = 32
             quality_lat = (0.55 if corr_flag else -0.45) + float(rng.normal(0.0, 0.50))
             len_z = (float(T_i) - base_len) / 100.0
 
-            # Self-certainty k_{i,t}: higher on correct rollouts, mild negative drift with length
             k_mean = base_k + 0.28 * quality_lat - 0.06 * len_z
             k_t = np.clip(rng.normal(k_mean, 0.22, size=seg_len), 0.05, 3.50)
 
-            # Log-prob l_{i,t}: noisier and more sensitive to length/surface entropy
             l_mean = base_l + 0.07 * quality_lat - 0.11 * len_z + float(rng.normal(0.0, 0.06))
             l_t = np.clip(rng.normal(l_mean, 0.15, size=seg_len), -2.50, -0.01)
 
@@ -461,7 +474,6 @@ def generate_synthetic_dataset_records(
                     rng.normal(0.0, 0.35)
                 )
                 v_mean = np.clip(base_v + 0.14 * vis_lat - 0.03 * len_z, 0.05, 0.85)
-                # Shared step-level visual-confidence driver induces realistic Cov_t(k_t, v_t)
                 coupling_sign = 0.045 if corr_flag else -0.015
                 shared_step = (k_t - np.mean(k_t)) / (np.std(k_t) + 1e-6)
                 v_t = np.clip(
@@ -482,8 +494,9 @@ def generate_synthetic_dataset_records(
             k_tokens_list.append(k_t)
             v_tokens_list.append(v_t)
 
+        offsets, k_flat, v_flat = _pack_token_streams(k_tokens_list, v_tokens_list)
         orders = np.stack(
-            [rng.permutation(num_rollouts).astype(np.int32) for _ in range(cfg.num_orders)],
+            [rng.permutation(num_rollouts).astype(np.int32) for _ in range(self.cfg.num_orders)],
             axis=0,
         )
 
@@ -501,8 +514,9 @@ def generate_synthetic_dataset_records(
             "KV": KV_arr,
             "cov_kv": cov_kv_arr,
             "corr_kv": corr_kv_arr,
-            "k_tokens": k_tokens_list,
-            "v_tokens": v_tokens_list,
+            "offsets": offsets,
+            "k_tokens": k_flat,
+            "v_tokens": v_flat,
             "orders": orders,
         }
 
@@ -515,10 +529,7 @@ def load_or_build_dataset_records(
     mode: str = "offline",
     data_dir: Optional[Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """
-    Loads precomputed 32-rollout records from disk if available, or builds and caches
-    them in `cfg.output_dir / "cache"` so all steps run reproducibly.
-    """
+    """Loads precomputed 32-rollout records or builds and caches them in CSR format."""
     search_dirs: List[Path] = []
     if data_dir is not None:
         search_dirs.append(Path(data_dir))
@@ -533,7 +544,8 @@ def load_or_build_dataset_records(
         pkl_path = s_dir / f"{dataset_key}_records.pkl"
         if pkl_path.exists() and mode != "rebuild":
             with open(pkl_path, "rb") as f:
-                return pickle.load(f)
+                loaded = pickle.load(f)
+            return _ensure_csr_record_format(loaded, cfg.num_rollouts)
 
     num_dev = int(getattr(cfg, "num_dev_questions", 200))
     num_eval = int(getattr(cfg, "num_eval_questions", 800))
@@ -553,24 +565,7 @@ def run_step4_visual_perturbation(
     mathvista_records: Dict[str, Dict[str, Any]],
     split_filter: str = "eval",
 ) -> Dict[str, Any]:
-    """
-    Step 4: Counterfactual Visual Grounding & Image Perturbation Diagnostic on MathVista.
-
-    Evaluates whether visual attention V_i and prefix-calibrated VisConf Z_i genuinely
-    reflect visual grounding rather than superficial text priors across four visual
-    conditions on a diagnostic subset of MathVista:
-      1. `clean`: Original unperturbed image.
-      2. `gaussian_blur`: Severely blurred image (high-frequency spatial detail removed).
-      3. `patch_occlusion`: Central 50% visual region occluded.
-      4. `image_swap`: Counterfactual mismatched image from a different question.
-
-    Also conducts a Mixed-Pool Decoy Stress Test (16 clean candidates + 16 visually
-    perturbed candidates with fluent text) comparing selection accuracy of:
-      - `best_self_certainty` (text confidence only, K_i)
-      - `rwc_self_certainty` (K_i + RWC)
-      - `best_visconf` (Z_i = V_i * C_i)
-      - `rwc_visconf` (Z_i + RWC)
-    """
+    """Step 4: Counterfactual Visual Grounding & Image Perturbation Diagnostic on MathVista."""
     step4_dir = cfg.output_dir / "step4"
     step4_dir.mkdir(parents=True, exist_ok=True)
 
@@ -602,7 +597,6 @@ def run_step4_visual_perturbation(
         for c in conditions
     }
 
-    # Mixed-pool decoy stress test (16 clean + 16 image_swap decoy rollouts per question)
     decoy_methods = [
         "self_consistency",
         "best_self_certainty",
@@ -625,6 +619,7 @@ def run_step4_visual_perturbation(
         clean_groups = list(rec["answer_groups"])
         gold_ans = rec.get("gold_answer", clean_groups[0])
         decoy_ans = f"{gold_ans}_swap_decoy"
+        k_list_orig, v_list_orig = _unpack_token_streams(rec, cfg.num_rollouts)
 
         for cond in conditions:
             p = cond_params[cond]
@@ -633,6 +628,8 @@ def run_step4_visual_perturbation(
                 K_c = clean_K
                 corr_c = clean_corr
                 groups_c = clean_groups
+                k_list_c = k_list_orig
+                v_list_c = v_list_orig
             else:
                 noise_v = rng.normal(0.0, 0.025, size=cfg.num_rollouts)
                 V_c = np.clip(clean_V * p["v_scale"] + p["v_shift"] + noise_v, 0.01, 0.99)
@@ -642,20 +639,30 @@ def run_step4_visual_perturbation(
                 keep_mask = rng.random(cfg.num_rollouts) < p["acc_keep"]
                 corr_c = clean_corr & keep_mask
                 groups_c = [
-                    clean_groups[r] if corr_c[r] else (decoy_ans if rng.random() < 0.65 else clean_groups[r])
+                    clean_groups[r]
+                    if corr_c[r]
+                    else (decoy_ans if rng.random() < 0.65 else clean_groups[r])
                     for r in range(cfg.num_rollouts)
                 ]
                 for r in range(cfg.num_rollouts):
                     if not corr_c[r] and groups_c[r] == gold_ans:
                         groups_c[r] = decoy_ans
 
+                k_list_c = [np.maximum(kt + p["k_shift"], 0.05) for kt in k_list_orig]
+                v_list_c = [
+                    np.clip(vt * p["v_scale"] + p["v_shift"], 0.01, 0.99)
+                    for vt in v_list_orig
+                ]
+
+            off_c, k_flat_c, v_flat_c = _pack_token_streams(k_list_c, v_list_c)
             temp_rec = {
                 "K": K_c,
                 "V": V_c,
                 "KV": K_c * V_c + rec["cov_kv"] * p["v_scale"],
                 "cov_kv": rec["cov_kv"] * p["v_scale"],
-                "k_tokens": [kt + p["k_shift"] for kt in rec.get("k_tokens", [])],
-                "v_tokens": [ np.clip(vt * p["v_scale"] + p["v_shift"], 0.01, 0.99) for vt in rec.get("v_tokens", []) ],
+                "offsets": off_c,
+                "k_tokens": k_flat_c,
+                "v_tokens": v_flat_c,
             }
             _, Z_c, _, _ = compute_prefix_visconf(temp_rec, full_prefix)
 
@@ -672,7 +679,7 @@ def run_step4_visual_perturbation(
             per_cond_vectors[cond]["rwc_k_acc"][idx] = 1.0 if rwc_k_ok else 0.0
             per_cond_vectors[cond]["rwc_z_acc"][idx] = 1.0 if rwc_z_ok else 0.0
 
-        # Mixed-Pool Decoy Stress Test: 16 clean rollouts + 16 fluent but ungrounded decoy rollouts
+        # Mixed-Pool Decoy Stress Test: 16 clean rollouts + 16 fluent ungrounded decoy rollouts
         half = cfg.num_rollouts // 2
         mix_K = np.concatenate([clean_K[:half], clean_K[half:] + 0.08])
         mix_V = np.concatenate([clean_V[:half], np.clip(clean_V[half:] * 0.32, 0.01, 0.95)])
@@ -680,17 +687,21 @@ def run_step4_visual_perturbation(
         mix_groups = clean_groups[:half] + [decoy_ans] * half
         mix_cov = np.concatenate([rec["cov_kv"][:half], -np.abs(rec["cov_kv"][half:]) * 0.5])
 
+        mix_k_list = k_list_orig[:half] + [kt + 0.08 for kt in k_list_orig[half:]]
+        mix_v_list = v_list_orig[:half] + [np.clip(vt * 0.32, 0.01, 0.95) for vt in v_list_orig[half:]]
+        off_m, k_flat_m, v_flat_m = _pack_token_streams(mix_k_list, mix_v_list)
+
         mix_rec = {
             "K": mix_K,
             "V": mix_V,
             "KV": mix_K * mix_V + mix_cov,
             "cov_kv": mix_cov,
-            "k_tokens": rec.get("k_tokens", [])[:half] + [kt + 0.08 for kt in rec.get("k_tokens", [])[half:]],
-            "v_tokens": rec.get("v_tokens", [])[:half] + [vt * 0.32 for vt in rec.get("v_tokens", [])[half:]],
+            "offsets": off_m,
+            "k_tokens": k_flat_m,
+            "v_tokens": v_flat_m,
         }
         _, mix_Z, _, _ = compute_prefix_visconf(mix_rec, full_prefix)
 
-        # Evaluate each selector on the mixed pool
         sc_g, sc_ok, _, _ = select_weighted_consensus(
             full_prefix, np.ones(cfg.num_rollouts, dtype=np.float64), mix_groups, mix_corr
         )

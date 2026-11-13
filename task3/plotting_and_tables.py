@@ -207,12 +207,40 @@ def plot_step2_aggregation_comparison(
             item = boot[k]
             clean_label = k.replace("N32_", "").replace("_vs_", " vs ")
             labels.append(clean_label)
-            m_val = float(item.get("mean_diff", item.get("delta_mean", 0.0))) * 100.0
-            lo_val = float(item.get("ci_low", item.get("ci_95_low", m_val))) * 100.0
-            hi_val = float(item.get("ci_high", item.get("ci_95_high", m_val))) * 100.0
+
+            m_raw = next(
+                (
+                    item[key]
+                    for key in ("mean_diff", "delta_mean", "diff_mean", "mean", "estimate", "diff")
+                    if key in item
+                ),
+                0.0,
+            )
+            lo_raw = next(
+                (
+                    item[key]
+                    for key in ("ci_low", "ci_95_low", "ci_lower", "lower", "low")
+                    if key in item
+                ),
+                m_raw,
+            )
+            hi_raw = next(
+                (
+                    item[key]
+                    for key in ("ci_high", "ci_95_high", "ci_upper", "upper", "high")
+                    if key in item
+                ),
+                m_raw,
+            )
+
+            m_val = float(m_raw) * 100.0
+            lo_val = float(lo_raw) * 100.0
+            hi_val = float(hi_raw) * 100.0
+            lo_val, hi_val = min(lo_val, m_val, hi_val), max(lo_val, m_val, hi_val)
+
             means.append(m_val)
-            ci_lows.append(m_val - lo_val)
-            ci_highs.append(hi_val - m_val)
+            ci_lows.append(max(0.0, m_val - lo_val))
+            ci_highs.append(max(0.0, hi_val - m_val))
 
         y_pos = np.arange(len(labels))
         ax1.errorbar(
@@ -260,7 +288,7 @@ def plot_step3_quartile_and_signals(
         top_accs = [s3[s]["top_quartile_acc"] * 100.0 for s in score_names]
         bot_accs = [s3[s]["bottom_quartile_acc"] * 100.0 for s in score_names]
         diffs = [s3[s]["mean_quartile_diff"] * 100.0 for s in score_names]
-        errs = [s3[s]["std_err_diff"] * 1.96 * 100.0 for s in score_names]
+        errs = [max(0.0, float(s3[s]["std_err_diff"])) * 1.96 * 100.0 for s in score_names]
 
         x = np.arange(len(score_names))
         width = 0.35

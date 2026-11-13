@@ -88,7 +88,7 @@ def extract_last_boxed_balanced(text: str) -> str:
     return extracted if extracted else NO_ANSWER
 
 
-def _clean_Missing_ans(val: Any) -> str:
+def _clean_missing_ans(val: Any) -> str:
     if val is None:
         return NO_ANSWER
     if isinstance(val, float) and np.isnan(val):
@@ -111,8 +111,8 @@ def group_and_grade_math_question(
     if hasattr(answer_utils, "group_and_grade_math"):
         return answer_utils.group_and_grade_math(raw_answers, gold_answer)
 
-    cleaned = [_clean_Missing_ans(a) for a in raw_answers]
-    gold_str = _clean_Missing_ans(gold_answer)
+    cleaned = [_clean_missing_ans(a) for a in raw_answers]
+    gold_str = _clean_missing_ans(gold_answer)
 
     try:
         from math_verify import parse, verify
@@ -131,7 +131,6 @@ def group_and_grade_math_question(
         )
         return groups, is_corr
 
-    # Deduplicate raw strings within the question to minimize math_verify calls
     unique_strs: List[str] = []
     for c in cleaned:
         if c != NO_ANSWER and c not in unique_strs:
@@ -155,7 +154,7 @@ def group_and_grade_math_question(
         except Exception:
             return False
 
-    clusters: List[str] = []  # canonical string per cluster
+    clusters: List[str] = []
     str_to_group: Dict[str, str] = {NO_ANSWER: NO_ANSWER}
 
     for u in unique_strs:
@@ -170,7 +169,6 @@ def group_and_grade_math_question(
         else:
             str_to_group[u] = matched_canon
 
-    # Grade each canonical cluster representative against gold_str
     try:
         gold_parsed = parse(f"${gold_str}$" if not gold_str.startswith("$") else gold_str)
     except Exception:
@@ -204,7 +202,7 @@ def normalize_mathvista_single(
     answer_type, choices, and precision rules from testmini.json WITHOUT consulting gold.
     Multiple-choice answers are represented as uppercase option letters (A, B, C, ...).
     """
-    s = _clean_Missing_ans(raw_ans)
+    s = _clean_missing_ans(raw_ans)
     if s == NO_ANSWER:
         return NO_ANSWER
 
@@ -217,7 +215,6 @@ def normalize_mathvista_single(
 
     if q_type == "multi_choice" or len(choices) > 0:
         s_clean = s.strip()
-        # Direct option letter match: "A", "(B)", "Option C", "C."
         m = re.match(r"^(?:option\s*)?[\(\[\{]?([A-Za-z])[\)\]\}\.\:]?$", s_clean, re.IGNORECASE)
         if m:
             letter = m.group(1).upper()
@@ -225,14 +222,12 @@ def normalize_mathvista_single(
             if 0 <= idx < max(len(choices), 26):
                 return letter
 
-        # Match against choice text strings
         s_low = s_clean.lower()
         for idx, ch_val in enumerate(choices):
             ch_str = str(ch_val).strip().lower()
             if s_low == ch_str:
                 return letters[idx]
 
-        # Numeric equivalence against choice values
         try:
             s_float = float(s_clean.replace(",", ""))
             for idx, ch_val in enumerate(choices):
@@ -244,13 +239,11 @@ def normalize_mathvista_single(
         except Exception:
             pass
 
-        # Leading letter fallback e.g. "A) 42"
         m2 = re.match(r"^([A-Za-z])[\)\.\:]\s+", s_clean)
         if m2:
             return m2.group(1).upper()
         return s_clean.upper() if len(s_clean) == 1 and s_clean.isalpha() else s_clean.lower()
 
-    # Free-form integer / float / text
     if ans_type in ("integer", "float"):
         num_match = re.findall(r"[-+]?\d+(?:\.\d+)?", s.replace(",", ""))
         if num_match:
@@ -333,6 +326,22 @@ def _pick_col(df: pd.DataFrame, candidates: Sequence[str], required: bool = True
     return None
 
 
+def _lookup_mv_meta(mv_meta: Dict[str, Any], qid_str: str) -> Dict[str, Any]:
+    if not mv_meta:
+        return {}
+    if qid_str in mv_meta:
+        return dict(mv_meta[qid_str])
+    tail = qid_str.split("_")[-1].split("-")[-1]
+    if tail in mv_meta:
+        return dict(mv_meta[tail])
+    nums = re.findall(r"\d+", qid_str)
+    if nums:
+        num_key = str(int(nums[-1]))
+        if num_key in mv_meta:
+            return dict(mv_meta[num_key])
+    return {}
+
+
 def load_or_build_dataset_records(
     cfg: Task3Config,
     dataset_key: str,
@@ -372,7 +381,6 @@ def load_or_build_dataset_records(
         attn_keys = [k for k in ("dataset", "sample_id", "rollout_id") if k in df.columns and k in df_attn.columns]
         df = pd.merge(df, df_attn, on=attn_keys, suffixes=("", "_attn"))
 
-    # Load MathVista testmini.json metadata if VLM
     mv_meta: Dict[str, Any] = {}
     if is_vlm:
         meta_candidates = list(root.rglob("testmini.json")) + [
@@ -394,18 +402,42 @@ def load_or_build_dataset_records(
     rid_col = _pick_col(df, ["rollout_id", "candidate_id", "rollout_idx"])
     ext_col = _pick_col(df, ["extracted_answer", "extracted_answers", "pred_answer", "extracted"])
     gold_col = _pick_col(df, ["gold_answer", "gold_answers", "gold", "target", "ground_truth", "answer"])
-    len_col = _pick_col(df, ["length", "lengths", "num_tokens", "token_count", "gen_length"], required=False)
+    len_col = _pick_col(
+        df,
+        ["n_generated_text_tokens", "length", "lengths", "num_tokens", "token_count", "gen_length"],
+        required=False,
+    )
+    tok_ids_col = _pick_col(df, ["generated_token_ids", "token_ids"], required=False)
     logp_col = _pick_col(df, ["logp", "sampled_token_logp", "token_logp", "logprobs"])
     kl_col = _pick_col(df, ["kl_u_p", "kl", "self_certainty"])
-    prompt_col = _pick_col(df, ["problem", "question", "prompt", "query", "input_text", "prompt_text"], required=False)
-    text_col = _pick_col(df, ["text", "response", "generation", "output_text", "completion"], required=False)
+    prompt_col = _pick_col(
+        df,
+        ["question_text", "problem", "question", "prompt", "query", "input_text"],
+        required=False,
+    )
+    text_col = _pick_col(
+        df,
+        ["generated_text", "text", "response", "generation", "output_text", "completion"],
+        required=False,
+    )
 
     if is_vlm:
-        img_attn_col = _pick_col(df, ["image", "image_attention", "attn_image", "a_image", "vision"])
-        prm_attn_col = _pick_col(df, ["prompt_text", "prompt", "prompt_attention", "attn_prompt", "a_prompt"])
-        gen_attn_col = _pick_col(df, ["generated_text", "generated", "gen_text", "generated_attention", "attn_generated", "a_generated"])
+        img_attn_col = _pick_col(
+            df,
+            ["img_attn_total", "image_attention", "attn_image", "a_image", "image", "vision"],
+        )
+        prm_attn_col = _pick_col(
+            df,
+            ["prompt_text_attn_total", "prompt_attention", "attn_prompt", "a_prompt", "prompt_text"],
+        )
+        gen_attn_col = _pick_col(
+            df,
+            ["generated_text_attn_total", "generated_attention", "attn_generated", "a_generated"],
+        )
+        attn_len_col = _pick_col(df, ["n_generated_text_tokens_attn"], required=False)
+    else:
+        attn_len_col = None
 
-    # Lexicographical sort of question IDs, then permute with default_rng(6304)
     df["_qid_str"] = df[qid_col].astype(str)
     all_qids_sorted = sorted(df["_qid_str"].unique().tolist())
     split_rng = np.random.default_rng(cfg.seed)
@@ -425,7 +457,6 @@ def load_or_build_dataset_records(
     else:
         active_dev = set(dev_qids_list)
 
-    # Save split IDs and scorer metadata
     split_dir = cfg.output_dir / "step1"
     split_dir.mkdir(parents=True, exist_ok=True)
     split_info = {
@@ -447,7 +478,11 @@ def load_or_build_dataset_records(
     alignment_mismatches = 0
 
     grouped = df.groupby("_qid_str", sort=False)
-    for qid_str, group in tqdm(grouped, desc=f"Building {dataset_key} records"):
+    for qid_str in tqdm(
+        [q for q in permuted_qids if q in grouped.groups],
+        desc=f"Building {dataset_key} records",
+    ):
+        group = grouped.get_group(qid_str)
         split_label = "dev" if qid_str in active_dev else "eval"
         group_sorted = group.sort_values(rid_col).head(cfg.num_rollouts)
         num_r = len(group_sorted)
@@ -455,9 +490,8 @@ def load_or_build_dataset_records(
         raw_exts = group_sorted[ext_col].tolist()
         gold_val = group_sorted[gold_col].iloc[0]
 
-        q_meta = mv_meta.get(qid_str, {}) if is_vlm else {}
+        q_meta = _lookup_mv_meta(mv_meta, qid_str) if is_vlm else {}
         if is_vlm:
-            # Merge any metadata columns present in the parquet row itself
             row0 = group_sorted.iloc[0]
             for mk in ("question_type", "answer_type", "choices", "precision", "unit"):
                 if mk not in q_meta and mk in row0 and row0[mk] is not None:
@@ -490,7 +524,12 @@ def load_or_build_dataset_records(
             else:
                 reported_len = T_tok
 
-            if len(logp) != len(kl) or (reported_len > 0 and len(logp) != reported_len):
+            if tok_ids_col is not None and row[tok_ids_col] is not None:
+                tok_ids_len = len(row[tok_ids_col])
+            else:
+                tok_ids_len = reported_len
+
+            if len(logp) != len(kl) or len(logp) != reported_len or len(logp) != tok_ids_len:
                 alignment_mismatches += 1
 
             T_eff = max(min(len(logp), len(kl)), 1)
@@ -505,7 +544,12 @@ def load_or_build_dataset_records(
                 a_img = np.asarray(row[img_attn_col], dtype=np.float64)[:T_eff]
                 a_prm = np.asarray(row[prm_attn_col], dtype=np.float64)[:T_eff]
                 a_gen = np.asarray(row[gen_attn_col], dtype=np.float64)[:T_eff]
-                if len(a_img) != len(kl):
+                if (
+                    len(a_img) != len(kl)
+                    or len(a_prm) != len(kl)
+                    or len(a_gen) != len(kl)
+                    or (attn_len_col is not None and int(row[attn_len_col]) != len(kl))
+                ):
                     alignment_mismatches += 1
                 denom = a_img + a_prm + a_gen
                 v_t = np.divide(
@@ -541,7 +585,7 @@ def load_or_build_dataset_records(
 
         row_first = group_sorted.iloc[0]
         problem_text = ""
-        if prompt_col is not None and not is_vlm and pd.notna(row_first[prompt_col]):
+        if prompt_col is not None and pd.notna(row_first[prompt_col]):
             problem_text = str(row_first[prompt_col])
         elif text_col is not None and pd.notna(row_first[text_col]):
             problem_text = str(row_first[text_col])
@@ -552,7 +596,7 @@ def load_or_build_dataset_records(
             "split": split_label,
             "gold_answer": str(gold_val),
             "problem_text": problem_text,
-            "raw_extracted_answers": [_clean_Missing_ans(x) for x in raw_exts],
+            "raw_extracted_answers": [_clean_missing_ans(x) for x in raw_exts],
             "answer_groups": ans_groups,
             "is_correct": is_corr,
             "lengths": lengths,
@@ -590,45 +634,34 @@ def _resolve_math_problem_texts(
     records: Dict[str, Dict[str, Any]],
 ) -> Dict[str, str]:
     """
-    Retrieves the original problem statement for each of the 50 MATH evaluation questions
-    from the supplied Parquet / JSON / README files.
+    Retrieves the original problem statement (`question_text`) for each of the 50 MATH
+    evaluation questions from the supplied records or Parquet table.
     """
-    pq_files = _find_parquet_files(data_root, is_vlm=False)
-    df_gen = pd.read_parquet(pq_files["generations"])
-    qid_col = _pick_col(df_gen, ["sample_id", "question_id", "qid", "id"])
-    df_gen["_qid_str"] = df_gen[qid_col].astype(str)
-    sub_df = df_gen[df_gen["_qid_str"].isin(set(target_qids))].drop_duplicates("_qid_str")
-
-    prob_col = _pick_col(
-        sub_df,
-        ["problem", "question", "prompt", "query", "input", "problem_text", "question_text"],
-        required=False,
-    )
     problems: Dict[str, str] = {}
-    if prob_col is not None:
-        for _, row in sub_df.iterrows():
-            problems[str(row["_qid_str"])] = str(row[prob_col])
+    for qid in target_qids:
+        p_txt = records.get(qid, {}).get("problem_text", "")
+        if p_txt and p_txt.strip():
+            problems[qid] = p_txt
 
-    # Check if a separate questions/problems JSON or parquet exists in data_root
     if len(problems) < len(target_qids):
-        for p_file in data_root.rglob("*.json*"):
-            if "testmini" in p_file.name.lower():
-                continue
-            try:
-                df_q = pd.read_json(p_file, lines=p_file.suffix == ".jsonl")
-                q_c = _pick_col(df_q, ["sample_id", "question_id", "id", "qid"], required=False)
-                p_c = _pick_col(df_q, ["problem", "question", "prompt"], required=False)
-                if q_c and p_c:
-                    for _, r in df_q.iterrows():
-                        k = str(r[q_c])
-                        if k in target_qids and k not in problems:
-                            problems[k] = str(r[p_c])
-            except Exception:
-                pass
+        pq_files = _find_parquet_files(data_root, is_vlm=False)
+        df_gen = pd.read_parquet(pq_files["generations"])
+        qid_col = _pick_col(df_gen, ["sample_id", "question_id", "qid", "id"])
+        df_gen["_qid_str"] = df_gen[qid_col].astype(str)
+        sub_df = df_gen[df_gen["_qid_str"].isin(set(target_qids))].drop_duplicates("_qid_str")
+
+        prob_col = _pick_col(
+            sub_df,
+            ["question_text", "problem", "question", "prompt", "query", "input", "problem_text"],
+            required=False,
+        )
+        if prob_col is not None:
+            for _, row in sub_df.iterrows():
+                problems[str(row["_qid_str"])] = str(row[prob_col])
 
     for qid in target_qids:
         if qid not in problems or not problems[qid].strip():
-            problems[qid] = records[qid].get("problem_text", f"Solve mathematical problem ID {qid}.")
+            problems[qid] = f"Solve mathematical problem ID {qid}."
     return problems
 
 
@@ -655,12 +688,16 @@ def run_step4_live_math_experiment(
     step4_dir.mkdir(parents=True, exist_ok=True)
 
     root = Path(data_dir) if data_dir is not None else Path(getattr(cfg, "data_dir", "/kaggle/working/data/task3"))
-    split_json = cfg.output_dir / "step1" / f"{next(iter(math_records.values()))['dataset']}_split_ids.json"
+    ds_name = next(iter(math_records.values()))["dataset"]
+    split_json = cfg.output_dir / "step1" / f"{ds_name}_split_ids.json"
     if split_json.exists():
         with open(split_json, "r", encoding="utf-8") as f:
             s_info = json.load(f)
         eval_ordered = [q for q in s_info.get("live_step4_50_question_ids", []) if q in math_records]
     else:
+        eval_ordered = [qid for qid, r in math_records.items() if r["split"] == "eval"]
+
+    if not eval_ordered:
         eval_ordered = [qid for qid, r in math_records.items() if r["split"] == "eval"]
 
     target_qids = eval_ordered[: (1 if smoke_mode else min(num_questions, len(eval_ordered)))]
@@ -759,15 +796,11 @@ def run_step4_live_math_experiment(
 
         base_seed = int(cfg.seed) + q_idx * 100
 
-        # 1. Single longer response (cap 3,072)
         res_long = _generate_once(base_messages, cap_long, base_seed + 1)
-
-        # 2. Parallel sampling: 3 independent responses (cap 1,024 each)
         res_p1 = _generate_once(base_messages, cap_short, base_seed + 2)
         res_p2 = _generate_once(base_messages, cap_short, base_seed + 3)
         res_p3 = _generate_once(base_messages, cap_short, base_seed + 4)
 
-        # 3. Sequential refinement: reuse res_p1 as assistant message + critique/revision (cap 2,048)
         refine_messages = [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": prob_text + user_suffix},
@@ -776,7 +809,6 @@ def run_step4_live_math_experiment(
         ]
         res_ref = _generate_once(refine_messages, cap_refine, base_seed + 5)
 
-        # Equivalence grouping & grading across the 5 generated answers for this question
         all_ext = [
             res_long["extracted_answer"],
             res_p1["extracted_answer"],
@@ -792,7 +824,6 @@ def run_step4_live_math_experiment(
         init_group, init_corr = all_groups[1], bool(all_corr[1])
         ref_group, ref_corr = all_groups[4], bool(all_corr[4])
 
-        # Self-consistency vote over the 3 parallel candidates (earliest tie-break)
         _, par_sc_corr, _, _ = select_weighted_consensus(
             np.array([0, 1, 2], dtype=np.int32),
             np.ones(3, dtype=np.float64),
@@ -800,7 +831,6 @@ def run_step4_live_math_experiment(
             p_corrs,
         )
 
-        # Transition from shared initial response (p1) to revised response
         if (not init_corr) and ref_corr:
             transition = "wrong_to_correct"
         elif init_corr and (not ref_corr):
@@ -841,7 +871,6 @@ def run_step4_live_math_experiment(
                     "revised_group": ref_group,
                     "is_correct": ref_corr,
                     "transition": transition,
-                    # Charge the shared initial response + revision prompt & critique/revision tokens
                     "input_tokens": res_p1["input_tokens"] + res_ref["input_tokens"],
                     "output_tokens": res_p1["output_tokens"] + res_ref["output_tokens"],
                     "runtime_sec": res_p1["runtime_sec"] + res_ref["runtime_sec"],
@@ -857,7 +886,6 @@ def run_step4_live_math_experiment(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Aggregate summary metrics across the 50 questions
     n_q = max(len(per_question_logs), 1)
     summary_rows = [
         {
@@ -932,12 +960,12 @@ def run_step4_live_math_experiment(
 
     transitions = [q["sequential_refinement"]["transition"] for q in per_question_logs]
     transition_summary = {
-        "wrong_to_correct_count": int( sum(t == "wrong_to_correct" for t in transitions) ),
-        "correct_to_wrong_count": int( sum(t == "correct_to_wrong" for t in transitions) ),
-        "correct_to_correct_count": int( sum(t == "correct_to_correct" for t in transitions) ),
-        "wrong_to_wrong_count": int( sum(t == "wrong_to_wrong" for t in transitions) ),
-        "wrong_to_correct_rate": float( sum(t == "wrong_to_correct" for t in transitions) / n_q ),
-        "correct_to_wrong_rate": float( sum(t == "correct_to_wrong" for t in transitions) / n_q ),
+        "wrong_to_correct_count": int(sum(t == "wrong_to_correct" for t in transitions)),
+        "correct_to_wrong_count": int(sum(t == "correct_to_wrong" for t in transitions)),
+        "correct_to_correct_count": int(sum(t == "correct_to_correct" for t in transitions)),
+        "wrong_to_wrong_count": int(sum(t == "wrong_to_wrong" for t in transitions)),
+        "wrong_to_correct_rate": float(sum(t == "wrong_to_correct" for t in transitions) / n_q),
+        "correct_to_wrong_rate": float(sum(t == "correct_to_wrong" for t in transitions) / n_q),
         "net_accuracy_gain": float(
             (sum(t == "wrong_to_correct" for t in transitions) - sum(t == "correct_to_wrong" for t in transitions)) / n_q
         ),
@@ -968,9 +996,8 @@ def extract_step6_qualitative_cases(
     step4_result: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Step 6: Extracts representative cases of (a) selection disagreement where RWC/VisConf
-    recovers a correct answer missed by majority voting, (b) sequential refinement
-    transitions from Step 4, and (c) premature adaptive stopping vs pool correctness rate.
+    Step 6: Extracts representative cases of selection disagreement where RWC/VisConf
+    recovers a correct answer missed by majority voting.
     """
     step6_dir = cfg.output_dir / "step6"
     step6_dir.mkdir(parents=True, exist_ok=True)

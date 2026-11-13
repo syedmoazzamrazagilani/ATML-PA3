@@ -33,10 +33,6 @@ def plot_step1_scaling_and_decomposition(
     results_by_dataset: Dict[str, Dict[str, Any]],
     cfg: Task3Config,
 ) -> List[Path]:
-    """
-    Plots Step 1 Oracle Coverage vs Self-Consistency accuracy and stacked error
-    decomposition (Sampling Failure vs Selection Failure) across N in {1, 2, 4, 8, 16, 32}.
-    """
     fig_dir = cfg.output_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
@@ -51,7 +47,6 @@ def plot_step1_scaling_and_decomposition(
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
 
-        # Left Panel: Scaling curves
         ax0 = axes[0]
         ax0.plot(
             x_pos,
@@ -87,7 +82,6 @@ def plot_step1_scaling_and_decomposition(
         ax0.grid(True, alpha=0.3)
         ax0.legend(loc="best", frameon=True)
 
-        # Right Panel: Stacked Failure Decomposition + Distinct Answer Groups
         ax1 = axes[1]
         samp_fail = sc_df["sampling_failure_rate"].to_numpy() * 100.0
         sel_fail = sc_df["selection_failure_rate"].to_numpy() * 100.0
@@ -97,7 +91,7 @@ def plot_step1_scaling_and_decomposition(
             samp_fail,
             width=0.55,
             color="#8da0cb",
-            label="Sampling Failure (1 - Oracle)",
+            label="Sampling Failure (No Correct Candidate)",
         )
         ax1.bar(
             x_pos,
@@ -105,13 +99,13 @@ def plot_step1_scaling_and_decomposition(
             width=0.55,
             bottom=samp_fail,
             color="#fc8d62",
-            label="Selection Failure (Oracle - SC)",
+            label="Selection Failure (Correct Missed)",
         )
         ax1.set_xticks(x_pos)
         ax1.set_xticklabels([str(n) for n in budgets])
         ax1.set_xlabel("Rollout Budget N")
         ax1.set_ylabel("Total Error Rate (%)")
-        ax1.set_title(f"{ds_key.upper()} — Error Decomposition & Diversity")
+        ax1.set_title(f"{ds_key.upper()} — Failure Decomposition & Answer Groups")
         ax1.grid(True, axis="y", alpha=0.3)
 
         ax1_twin = ax1.twinx()
@@ -143,10 +137,6 @@ def plot_step2_aggregation_comparison(
     results_by_dataset: Dict[str, Dict[str, Any]],
     cfg: Task3Config,
 ) -> List[Path]:
-    """
-    Plots Step 2 accuracy scaling curves across aggregation methods and N=32
-    paired bootstrap confidence interval comparisons.
-    """
     fig_dir = cfg.output_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
@@ -160,7 +150,6 @@ def plot_step2_aggregation_comparison(
 
         fig, axes = plt.subplots(1, 2, figsize=(13, 5.0))
 
-        # Left Panel: Method scaling curves
         ax0 = axes[0]
         plot_methods = [
             "self_consistency",
@@ -169,7 +158,7 @@ def plot_step2_aggregation_comparison(
             "rwc_self_certainty",
             "shortest_length",
         ]
-        if ds_key == "mathvista":
+        if ds_key.lower() == "mathvista":
             plot_methods.extend(["best_vision", "best_visconf", "rwc_visconf"])
 
         for m in plot_methods:
@@ -195,13 +184,9 @@ def plot_step2_aggregation_comparison(
         ax0.grid(True, alpha=0.3)
         ax0.legend(loc="lower right", fontsize=8, frameon=True)
 
-        # Right Panel: Paired bootstrap deltas at N=32
         ax1 = axes[1]
         n32_keys = [k for k in boot.keys() if k.startswith("N32_")]
-        labels = []
-        means = []
-        ci_lows = []
-        ci_highs = []
+        labels, means, ci_lows, ci_highs = [], [], [], []
 
         for k in n32_keys:
             item = boot[k]
@@ -274,10 +259,6 @@ def plot_step3_quartile_and_signals(
     results_by_dataset: Dict[str, Dict[str, Any]],
     cfg: Task3Config,
 ) -> List[Path]:
-    """
-    Plots Step 3 Top-Quartile vs Bottom-Quartile rollout accuracy and within-question
-    score-length correlations at N=32.
-    """
     fig_dir = cfg.output_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
@@ -324,65 +305,50 @@ def plot_step3_quartile_and_signals(
     return saved_paths
 
 
-def plot_step4_visual_perturbation(
+def plot_step4_live_comparison(
     step4_result: Dict[str, Any],
     cfg: Task3Config,
 ) -> List[Path]:
-    """
-    Plots Step 4 visual grounding degradation across image perturbation conditions
-    and mixed-pool decoy discrimination accuracy on MathVista.
-    """
     fig_dir = cfg.output_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
 
-    cond_df = pd.DataFrame(step4_result["perturbation_conditions"])
-    decoy_df = pd.DataFrame(step4_result["mixed_pool_stress_test"])
+    if "strategy_summary" not in step4_result:
+        return saved_paths
+
+    df = pd.DataFrame(step4_result["strategy_summary"])
+    trans = step4_result.get("refinement_transitions", {})
 
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
 
-    # Left Panel: Signal & accuracy across visual perturbation conditions
     ax0 = axes[0]
-    x = np.arange(len(cond_df))
-    w = 0.26
-    ax0.bar(x - w, cond_df["mean_V"] * 100.0, width=w, label="Mean Visual Attention V (x100)", color="#41b6c4")
-    ax0.bar(x, cond_df["rwc_self_certainty_acc"] * 100.0, width=w, label="RWC (Self-Certainty K) Acc (%)", color="#fd8d3c")
-    ax0.bar(x + w, cond_df["rwc_visconf_acc"] * 100.0, width=w, label="RWC (VisConf Z) Acc (%)", color="#225ea8")
+    x = np.arange(len(df))
+    w = 0.28
+    ax0.bar(x - w, df["accuracy"] * 100.0, width=w, label="Accuracy (%)", color="#2b8cbe")
+    ax0.bar(x, df["extraction_rate"] * 100.0, width=w, label="Boxed Extraction Rate (%)", color="#7bccc4")
+    ax0.bar(x + w, df["truncation_rate"] * 100.0, width=w, label="Truncation Rate (%)", color="#e34a33")
     ax0.set_xticks(x)
-    ax0.set_xticklabels(cond_df["condition"].tolist(), rotation=12)
-    ax0.set_ylabel("Score / Accuracy (%)")
-    ax0.set_title("MathVista Step 4 — Visual Perturbation Response")
+    ax0.set_xticklabels(df["strategy"].tolist(), rotation=15, ha="right", fontsize=8)
+    ax0.set_ylabel("Rate (%)")
+    ax0.set_title("MATH Step 4 Live — Accuracy, Extraction & Truncation")
     ax0.grid(True, axis="y", alpha=0.3)
     ax0.legend(loc="best", fontsize=8, frameon=True)
 
-    # Right Panel: Mixed-pool decoy stress test
     ax1 = axes[1]
-    x2 = np.arange(len(decoy_df))
-    w2 = 0.35
-    ax1.bar(
-        x2 - w2 / 2,
-        decoy_df["mixed_pool_accuracy"] * 100.0,
-        width=w2,
-        label="Selection Accuracy (%)",
-        color="#238b45",
-    )
-    ax1.bar(
-        x2 + w2 / 2,
-        decoy_df["ungrounded_decoy_selection_rate"] * 100.0,
-        width=w2,
-        label="Ungrounded Decoy Pick Rate (%)",
-        color="#cb181d",
-    )
-    ax1.set_xticks(x2)
-    ax1.set_xticklabels(decoy_df["method"].tolist(), rotation=18, ha="right", fontsize=8)
-    ax1.set_ylabel("Rate (%)")
-    ax1.set_title("MathVista Step 4 — Mixed Clean+Decoy Stress Test")
+    t_keys = ["wrong_to_correct_count", "correct_to_wrong_count", "correct_to_correct_count", "wrong_to_wrong_count"]
+    t_labels = ["Wrong -> Correct", "Correct -> Wrong", "Correct -> Correct", "Wrong -> Wrong"]
+    t_vals = [int(trans.get(k, 0)) for k in t_keys]
+    colors = ["#31a354", "#de2d26", "#6baed6", "#969696"]
+    ax1.bar(np.arange(len(t_labels)), t_vals, width=0.5, color=colors)
+    ax1.set_xticks(np.arange(len(t_labels)))
+    ax1.set_xticklabels(t_labels, rotation=12, fontsize=9)
+    ax1.set_ylabel("Number of Questions (out of 50)")
+    ax1.set_title("MATH Step 4 Live — Sequential Refinement Transitions")
     ax1.grid(True, axis="y", alpha=0.3)
-    ax1.legend(loc="best", fontsize=8, frameon=True)
 
     fig.tight_layout()
     for ext in ("png", "pdf"):
-        out_p = fig_dir / f"step4_mathvista_perturbation.{ext}"
+        out_p = fig_dir / f"step4_math_live_comparison.{ext}"
         fig.savefig(out_p, dpi=220)
         saved_paths.append(out_p)
     plt.close(fig)
@@ -394,10 +360,6 @@ def plot_step5_adaptive_pareto(
     results_by_dataset: Dict[str, Dict[str, Any]],
     cfg: Task3Config,
 ) -> List[Path]:
-    """
-    Plots Step 5 Accuracy vs Token Cost Pareto curve (Fixed-N Self-Consistency vs
-    Dev-tuned Agreement and Quality-Aware adaptive controllers) and stopping distributions.
-    """
     fig_dir = cfg.output_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
     saved_paths: List[Path] = []
@@ -409,7 +371,6 @@ def plot_step5_adaptive_pareto(
 
         fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.8))
 
-        # Left Panel: Accuracy vs Token Cost Pareto Frontier
         ax0 = axes[0]
         ax0.plot(
             sc_df["mean_token_cost"],
@@ -437,7 +398,7 @@ def plot_step5_adaptive_pareto(
             marker="^",
             color="#e6550d",
             zorder=5,
-            label=f"Agreement Adaptive (tau={agree_res['tau']:.2f})",
+            label=f"Agreement Adaptive (tau={agree_res['tau']:.3g})",
         )
         ax0.scatter(
             [qa_res["mean_token_cost"]],
@@ -446,7 +407,7 @@ def plot_step5_adaptive_pareto(
             marker="*",
             color="#31a354",
             zorder=6,
-            label=f"Quality-Aware Adaptive (tau={qa_res['tau']:.2f}, gamma={qa_res['gamma']:.2f})",
+            label=f"Quality-Aware Adaptive (tau={qa_res['tau']:.3g}, gamma={qa_res['gamma']:.3g})",
         )
         ax0.set_xlabel("Mean Token Cost per Question (Held-out Split)")
         ax0.set_ylabel("Accuracy (%)")
@@ -454,7 +415,6 @@ def plot_step5_adaptive_pareto(
         ax0.grid(True, alpha=0.3)
         ax0.legend(loc="lower right", fontsize=8, frameon=True)
 
-        # Right Panel: Stopping Budget Distribution
         ax1 = axes[1]
         checkpoints = [str(c) for c in list(cfg.adaptive_checkpoints) + [32]]
         agree_probs = [agree_res["stopping_distribution"].get(k, 0.0) * 100.0 for k in checkpoints]
@@ -486,19 +446,14 @@ def export_all_tables(
     step4_result: Optional[Dict[str, Any]],
     cfg: Task3Config,
 ) -> Path:
-    """
-    Writes formatted Markdown (.md) and LaTeX (.tex) summary tables and a consolidated
-    Executive Summary report under `cfg.output_dir / "tables"`.
-    """
     table_dir = cfg.output_dir / "tables"
     table_dir.mkdir(parents=True, exist_ok=True)
 
-    md_lines: List[str] = ["# Task 3 Empirical Evaluation Summary Report\n"]
+    md_lines: List[str] = ["# Task 3 Test-Time Compute Evaluation Summary\n"]
 
     for ds_key, ds_res in results_by_dataset.items():
-        md_lines.append(f"## Dataset: `{ds_key.upper()}` (Held-Out Eval Split)\n")
+        md_lines.append(f"## Dataset: `{ds_key.upper()}` (Held-Out Evaluation Split, 800 Questions)\n")
 
-        # Step 1 & Step 2 at N=32
         df_s2: pd.DataFrame = ds_res["step2_df"]
         df_n32 = df_s2[df_s2["N"] == 32].copy()
         df_n32.to_csv(table_dir / f"{ds_key}_n32_methods.csv", index=False)
@@ -509,18 +464,17 @@ def export_all_tables(
 
         md_lines.append("### Step 1 & 2: Aggregation Performance at N = 32\n")
         md_lines.append(
-            "| Method | Accuracy (%) | Oracle Coverage (%) | Sampling Fail (%) | Selection Fail (%) | Mean Tokens |"
+            "| Method | Accuracy (%) | Oracle Coverage (%) | Sampling Fail (%) | Selection Fail (%) | Distinct Groups | Mean Tokens |"
         )
-        md_lines.append("|---|---:|---:|---:|---:|---:|")
+        md_lines.append("|---|---:|---:|---:|---:|---:|---:|")
         for _, r in df_n32.iterrows():
             md_lines.append(
                 f"| `{r['method']}` | {r['accuracy']*100:.2f} | {r['oracle_coverage']*100:.2f} | "
                 f"{r['sampling_failure_rate']*100:.2f} | {r['selection_failure_rate']*100:.2f} | "
-                f"{r['mean_token_cost']:.1f} |"
+                f"{r['distinct_answer_groups']:.2f} | {r['mean_token_cost']:.1f} |"
             )
         md_lines.append("")
 
-        # Step 3 Quartile Table
         s3_q = ds_res["step3"]["quartile_analysis"]
         md_lines.append("### Step 3: Within-Question Top vs Bottom Quartile Analysis (N = 32)\n")
         md_lines.append(
@@ -540,9 +494,8 @@ def export_all_tables(
             )
         md_lines.append("")
 
-        # Step 5 Adaptive Stopping Table
         s5_eval = ds_res["step5"]["eval_results"]
-        md_lines.append("### Step 5: Held-Out Adaptive Compute Allocation\n")
+        md_lines.append("### Step 5: Held-Out Adaptive Sampling vs Fixed-32 Self-Consistency\n")
         md_lines.append(
             "| Controller | Selected (tau, gamma) | Accuracy (%) | Mean Rollouts | Mean Tokens | Token Savings vs Fixed-32 (%) |"
         )
@@ -550,23 +503,35 @@ def export_all_tables(
         for c_key in ("fixed_32", "agreement", "quality_aware"):
             item = s5_eval[c_key]
             md_lines.append(
-                f"| `{c_key}` | ({item['tau']:.2f}, {item['gamma']:.2f}) | "
+                f"| `{c_key}` | ({item['tau']:.3g}, {item['gamma']:.3g}) | "
                 f"{item['accuracy']*100:.2f} | {item['mean_rollouts']:.2f} | "
                 f"{item['mean_token_cost']:.1f} | {item['token_savings_vs_fixed32']*100:.2f} |"
             )
         md_lines.append("")
 
-    if step4_result is not None:
-        md_lines.append("## Step 4: MathVista Counterfactual Visual Perturbation & Stress Test\n")
-        md_lines.append("| Visual Condition | Mean V | Mean K | Mean VisConf Z | RWC(K) Acc (%) | RWC(Z) Acc (%) |")
-        md_lines.append("|---|---:|---:|---:|---:|---:|")
-        for row in step4_result["perturbation_conditions"]:
+    if step4_result is not None and "strategy_summary" in step4_result:
+        md_lines.append("## Step 4: Live Generation on 50 MATH Evaluation Questions (`Qwen/Qwen2.5-3B-Instruct`)\n")
+        md_lines.append(
+            "| Strategy | Accuracy (%) | Mean In Tokens | Mean Out Tokens | Runtime (s/q) | Peak GPU (MB) | Extraction (%) | Truncation (%) |"
+        )
+        md_lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        for row in step4_result["strategy_summary"]:
             md_lines.append(
-                f"| `{row['condition']}` | {row['mean_V']:.3f} | {row['mean_K']:.3f} | "
-                f"{row['mean_Z']:.3f} | {row['rwc_self_certainty_acc']*100:.2f} | "
-                f"{row['rwc_visconf_acc']*100:.2f} |"
+                f"| `{row['strategy']}` | {row['accuracy']*100:.2f} | "
+                f"{row['mean_input_tokens']:.1f} | {row['mean_output_tokens']:.1f} | "
+                f"{row['mean_runtime_sec']:.2f} | {row['peak_gpu_mb']:.0f} | "
+                f"{row['extraction_rate']*100:.1f} | {row['truncation_rate']*100:.1f} |"
             )
         md_lines.append("")
+        tr = step4_result.get("refinement_transitions", {})
+        md_lines.append(
+            f"**Sequential Refinement Transitions:** "
+            f"Wrong->Correct = {tr.get('wrong_to_correct_count', 0)}, "
+            f"Correct->Wrong = {tr.get('correct_to_wrong_count', 0)}, "
+            f"Correct->Correct = {tr.get('correct_to_correct_count', 0)}, "
+            f"Wrong->Wrong = {tr.get('wrong_to_wrong_count', 0)} "
+            f"(Net Accuracy Change: {tr.get('net_accuracy_gain', 0.0)*100:+.2f} pp).\n"
+        )
 
     report_path = table_dir / "task3_executive_summary.md"
     with open(report_path, "w", encoding="utf-8") as f:
@@ -580,13 +545,12 @@ def generate_all_plots_and_tables(
     step4_result: Optional[Dict[str, Any]],
     cfg: Task3Config,
 ) -> Dict[str, Any]:
-    """Runs all figure and table generators and returns paths to generated artifacts."""
     figs: List[Path] = []
     figs.extend(plot_step1_scaling_and_decomposition(results_by_dataset, cfg))
     figs.extend(plot_step2_aggregation_comparison(results_by_dataset, cfg))
     figs.extend(plot_step3_quartile_and_signals(results_by_dataset, cfg))
     if step4_result is not None:
-        figs.extend(plot_step4_visual_perturbation(step4_result, cfg))
+        figs.extend(plot_step4_live_comparison(step4_result, cfg))
     figs.extend(plot_step5_adaptive_pareto(results_by_dataset, cfg))
 
     report_path = export_all_tables(results_by_dataset, step4_result, cfg)

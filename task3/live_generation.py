@@ -41,6 +41,20 @@ def _get_math_verify_version() -> str:
         return "unknown"
 
 
+def _scalar_or_array_len(val: Any, fallback: int) -> int:
+    """Safely extracts token count from either an integer scalar or a 1D token array."""
+    if val is None:
+        return fallback
+    if isinstance(val, (list, tuple, np.ndarray, pd.Series)):
+        return len(val)
+    try:
+        if pd.isna(val):
+            return fallback
+        return int(val)
+    except Exception:
+        return fallback
+
+
 def extract_last_boxed_balanced(text: str) -> str:
     """
     Extracts the last \\boxed{...} or \\fbox{...} expression using balanced braces.
@@ -519,15 +533,16 @@ def load_or_build_dataset_records(
             kl = np.asarray(row[kl_col], dtype=np.float64)
 
             T_tok = len(logp)
-            if len_col is not None and pd.notna(row[len_col]):
-                reported_len = int(row[len_col])
-            else:
-                reported_len = T_tok
-
-            if tok_ids_col is not None and row[tok_ids_col] is not None:
-                tok_ids_len = len(row[tok_ids_col])
-            else:
-                tok_ids_len = reported_len
+            reported_len = (
+                _scalar_or_array_len(row[len_col], T_tok)
+                if len_col is not None
+                else T_tok
+            )
+            tok_ids_len = (
+                _scalar_or_array_len(row[tok_ids_col], reported_len)
+                if tok_ids_col is not None
+                else reported_len
+            )
 
             if len(logp) != len(kl) or len(logp) != reported_len or len(logp) != tok_ids_len:
                 alignment_mismatches += 1
@@ -544,11 +559,16 @@ def load_or_build_dataset_records(
                 a_img = np.asarray(row[img_attn_col], dtype=np.float64)[:T_eff]
                 a_prm = np.asarray(row[prm_attn_col], dtype=np.float64)[:T_eff]
                 a_gen = np.asarray(row[gen_attn_col], dtype=np.float64)[:T_eff]
+                attn_len_val = (
+                    _scalar_or_array_len(row[attn_len_col], len(kl))
+                    if attn_len_col is not None
+                    else len(kl)
+                )
                 if (
                     len(a_img) != len(kl)
                     or len(a_prm) != len(kl)
                     or len(a_gen) != len(kl)
-                    or (attn_len_col is not None and int(row[attn_len_col]) != len(kl))
+                    or attn_len_val != len(kl)
                 ):
                     alignment_mismatches += 1
                 denom = a_img + a_prm + a_gen
@@ -585,9 +605,9 @@ def load_or_build_dataset_records(
 
         row_first = group_sorted.iloc[0]
         problem_text = ""
-        if prompt_col is not None and pd.notna(row_first[prompt_col]):
+        if prompt_col is not None and row_first[prompt_col] is not None:
             problem_text = str(row_first[prompt_col])
-        elif text_col is not None and pd.notna(row_first[text_col]):
+        elif text_col is not None and row_first[text_col] is not None:
             problem_text = str(row_first[text_col])
 
         records[qid_str] = {
@@ -718,6 +738,11 @@ def run_step4_live_math_experiment(
     if device != "cuda":
         model.to(device)
     model.eval()
+    input_device = next(model.parameters()).device
+
+    eos_id = tokenizer.eos_token_id
+    if isinstance(eos_id, (list, tuple)):
+        eos_id = eos_id[0]
 
     cap_long = 64 if smoke_mode else 3072
     cap_short = 32 if smoke_mode else 1024
@@ -734,7 +759,7 @@ def run_step4_live_math_experiment(
         prompt_text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(input_device)
         in_toks = int(inputs["input_ids"].shape[1])
 
         torch.manual_seed(call_seed)
@@ -753,7 +778,7 @@ def run_step4_live_math_experiment(
                 top_k=20,
                 repetition_penalty=1.0,
                 max_new_tokens=max_new_toks,
-                pad_token_id=tokenizer.eos_token_id,
+                pad_token_id=eos_id,
             )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -766,7 +791,7 @@ def run_step4_live_math_experiment(
 
         gen_ids = out[0, in_toks:]
         out_toks = int(gen_ids.shape[0])
-        hit_eos = bool(len(gen_ids) > 0 and int(gen_ids[-1].item()) == int(tokenizer.eos_token_id))
+        hit_eos = bool(len(gen_ids) > 0 and eos_id is not None and int(gen_ids[-1].item()) == int(eos_id))
         truncated = bool(out_toks >= max_new_toks and not hit_eos)
         resp_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
         extracted = extract_last_boxed_balanced(resp_text)
